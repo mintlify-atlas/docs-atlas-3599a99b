@@ -1,0 +1,215 @@
+---
+title: "RMS Norm Kernel Walkthrough: 2.6 TB/s on H100"
+description: "End-to-end walkthrough of pyptx's RMS norm kernel: v4 vectorized loads, warp butterfly reduce, two-phase SMEM broadcast, and 88% HBM utilization on H100."
+---
+
+The RMS norm kernel in `examples/hopper/rms_norm.py` is the simplest real kernel in the pyptx repo. It reaches **2.6 TB/s at B=2048, N=8192 on H100 SXM5** (88% of HBM3 peak), running **3.9× faster** than the PyTorch eager implementation. It is deliberately the first kernel to read after [Writing Your First Kernel](/guides/first-kernel) — nothing here requires tensor-core intrinsics, so every DSL primitive is tested in isolation.
+
+The formula per batch row:
+
+```text
+Y[b, i] = X[b, i] * W[i] / sqrt(mean(X[b, :]²) + eps)
+```
+
+One CTA per batch row, `B` CTAs total. Inside the CTA, `block` threads cooperate on that row. No cross-CTA communication.
+
+## Why This Kernel Tests the DSL
+
+RMS norm is a good DSL stress test because the hot path is `ld.global.v4.f32` — not `wgmma.mma_async`. If any of these operations needed an escape hatch, the kernel would read like hand-rolled assembler instead of a DSL:
+
+- `ld.global.v4.f32` and `st.global.v4.f32` with register lists must map cleanly to the PTX form.
+- `fma.rn.f32(sum_sq, x, x, sum_sq)` must be one instruction, not lowered from Python `*` and `+`.
+- `rsqrt.approx.f32`, `warp.reduce_sum`, and `bar.sync(0)` need to be first-class.
+- `smem.alloc(f32, (num_warps, 1))` must work for tiny staging, not just WGMMA tiles.
+
+## Step 1: Pick the Block Size
+
+`_pick_block(n)` selects the CTA size that maximizes memory-level parallelism:
+
+```python
+for block in (512, 256, 128, 64, 32):
+    ipt = n // block
+    if n % block == 0 and ipt >= 4 and ipt % 4 == 0 and block >= 128:
+        # pick the block with the most items per thread
+```
+
+The "divisible by 4" constraint ensures every memory transaction can be a `ld.global.v4.f32` — one 16-byte load feeding four accumulator FMAs. More outstanding v4 loads per thread means more DRAM requests in flight and better HBM utilization.
+
+## Step 2: Declare the Kernel
+
+```python
+@kernel(
+    in_specs=(Tile(B, N, f32), Tile(N, f32)),
+    out_specs=(Tile(B, N, f32),),
+    grid=(B, 1, 1),
+    block=(block, 1, 1),
+    arch=arch,
+)
+def rms_norm(X, W, Y):
+    ...
+```
+
+`in_specs` declares the full tensor shapes so the framework can validate dtypes and build TMA descriptors if needed. For this kernel, inputs are loaded via plain `ld.global.*` (no TMA, no swizzle), so `Layout.ROW` (the default) is correct.
+
+## Step 3: Prologue — Shared Memory, Pointers, and Thread IDs
+
+<Steps>
+  <Step title="Allocate shared memory">
+    Two tiny allocations: one for per-warp partial sums, one for the broadcasted block sum.
+
+    ```python
+    partials = smem.alloc(f32, (num_warps, 1))
+    stats    = smem.alloc(f32, (1, 1))
+    ```
+
+    These are not WGMMA tiles — plain row-major `smem.alloc`, indexed with `[row, col]`.
+  </Step>
+
+  <Step title="Unpack parameter pointers">
+    ```python
+    px, pw, py = ptx.global_ptrs(X, W, Y)
+    ```
+
+    One call unpacks three parameter-pointer prologues. Without `global_ptrs`, you'd write three near-identical `ld.param.u64` sequences by hand.
+  </Step>
+
+  <Step title="Compute per-thread bookkeeping">
+    ```python
+    tid = reg.scalar(u32); ptx.inst.mov.u32(tid, ptx.special.tid.x())
+    row = reg.scalar(u32); ptx.inst.mov.u32(row, ptx.special.ctaid.x())
+    row_byte_off = row * (N * 4)   # mul.lo.s32 → u32 (then widened)
+    px += row_byte_off             # add.s64 on b64 base pointer
+    py += row_byte_off
+    lane    = tid & (WARP_SIZE - 1)
+    warp_id = tid >> 5
+    ```
+
+    `row * (N * 4)` uses Python operator overloading on `Reg`. The DSL emits `mul.lo.s32` under the covers — exactly what you'd write by hand for a row-byte-offset multiply.
+  </Step>
+</Steps>
+
+## Step 4: Pass 1 — Load and Square
+
+With vectorized loads (`use_v4=True`), each thread executes `v4_iters = items_per_thread // 4` 16-byte loads:
+
+```python
+sum_sq = reg.scalar(f32, init=0.0)
+x_vals = reg.array(f32, items_per_thread)   # held in regs through the whole kernel
+
+elem_base = tid << 2   # lane-0 element index for this thread
+for j in range(v4_iters):
+    idx = elem_base if j == 0 else elem_base + (j * block * 4)
+    ptr = px + idx * 4
+
+    # One 16-byte load: fills four f32 registers
+    ptx.inst.ld.global_.v4.f32(
+        [x_vals[j*4], x_vals[j*4+1], x_vals[j*4+2], x_vals[j*4+3]],
+        ptx.addr(ptr),
+    )
+    for sub in range(4):
+        ptx.inst.fma.rn.f32(sum_sq, x_vals[j*4+sub], x_vals[j*4+sub], sum_sq)
+```
+
+Two design choices worth noting:
+
+1. **`x_vals` is preserved across both passes.** The per-thread slice stays in registers through the whole kernel, so pass 2 doesn't re-read from global. That turns a 2-pass-over-HBM algorithm into effectively 1.5 passes — weights load again, inputs don't.
+2. **`fma.rn.f32(sum_sq, x, x, sum_sq)` is one PTX instruction** doing `sum_sq = x*x + sum_sq` round-nearest. Writing `sum_sq = sum_sq + x*x` in the DSL would emit two instructions (mul + add).
+
+## Step 5: Warp Reduce, Then Block Reduce
+
+```python
+# Phase 1: warp-level butterfly reduction
+ptx.warp.reduce_sum(sum_sq)
+
+# Phase 2: lane 0 of each warp writes partial to SMEM
+with ptx.if_(lane == 0):
+    partials[warp_id, 0] = sum_sq
+ptx.bar.sync(0)
+
+# Phase 3: thread 0 collapses per-warp partials
+with ptx.if_(tid == 0):
+    block_sum = reg.scalar(f32, init=0.0)
+    for i in range(num_warps):
+        ptx.inst.add.f32(block_sum, block_sum, partials[i, 0])
+    stats[0, 0] = block_sum
+ptx.bar.sync(0)
+
+# All threads read the broadcasted result
+ptx.inst.mov.f32(sum_sq, stats[0, 0])
+```
+
+Three hops:
+
+1. `ptx.warp.reduce_sum` is a butterfly `shfl.bfly.sync` reduction — the DSL emits the same five PTX instructions you'd write manually.
+2. Lane 0 of each warp writes its sum. `bar.sync(0)` ensures all warps are past this point.
+3. Thread 0 collapses partials in a trivial linear scan (cheap for small `num_warps`) and parks the result in `stats[0,0]`. The second `bar.sync(0)` makes it visible to the whole CTA.
+
+## Step 6: Compute rstd Once Per Thread
+
+```python
+mean_sq = reg.scalar(f32)
+inv_n   = reg.scalar(f32, init=1.0 / N)   # baked in at trace time
+ptx.inst.mul.f32(mean_sq, sum_sq, inv_n)
+eps_reg = reg.scalar(f32, init=eps)
+ptx.inst.add.f32(mean_sq, mean_sq, eps_reg)
+rstd    = reg.scalar(f32)
+ptx.inst.rsqrt.approx.f32(rstd, mean_sq)
+```
+
+`rsqrt.approx.f32` is the single-instruction reciprocal square root. `1.0 / N` is baked in at trace time as a float constant — no division on the hot path.
+
+## Step 7: Pass 2 — Load W, Multiply, Store
+
+```python
+for j in range(v4_iters):
+    idx = elem_base if j == 0 else elem_base + (j * block * 4)
+    off = idx * 4
+
+    # Load W (fresh each pass — it's N-wide and cached)
+    w_vals = [reg.scalar(f32) for _ in range(4)]
+    ptx.inst.ld.global_.v4.f32(w_vals, ptx.addr(pw + off))
+
+    # Multiply x * rstd * w
+    y_vals = []
+    for sub in range(4):
+        y_val = reg.scalar(f32)
+        ptx.inst.mul.f32(y_val, x_vals[j*4+sub], rstd)
+        ptx.inst.mul.f32(y_val, y_val, w_vals[sub])
+        y_vals.append(y_val)
+
+    # Write output — also v4
+    ptx.inst.st.global_.v4.f32(ptx.addr(py + off), y_vals)
+
+ptx.ret()
+```
+
+`x_vals` is still in registers from pass 1. `W` is read fresh (it's N-wide, so it fits in L2). Every DRAM transaction in this kernel is 16 bytes.
+
+## Performance
+
+| Config | Throughput | HBM utilization | vs PyTorch |
+|---|---|---|---|
+| B=2048, N=8192 on H100 SXM5 | **2.6 TB/s** | **88%** | **3.9×** |
+
+The kernel is bandwidth-bound — the tensor-core path doesn't help here. Reaching 88% HBM peak from Python DSL code validates that the DSL stays honest when the hot path is memory access rather than compute.
+
+<Tip>
+The vectorized v4 load path is selected when `items_per_thread >= 4` and `items_per_thread % 4 == 0`. For very small N or unusual block sizes, the kernel falls back to scalar `ld.global.f32` loads automatically.
+</Tip>
+
+## What To Read Next
+
+<CardGroup cols={2}>
+  <Card title="Hopper GEMM" href="/guides/handwritten-gemm">
+    When the hot path is wgmma.mma_async instead of ld.global.v4.
+  </Card>
+  <Card title="Registers and Shared Memory" href="/guides/registers-and-smem">
+    Deep reference for reg.scalar, reg.array, and smem.alloc.
+  </Card>
+  <Card title="Tiles, Layouts, and TMA" href="/guides/tiles-layouts-tma">
+    How in_specs/out_specs connect to the runtime.
+  </Card>
+  <Card title="Debugging" href="/guides/debugging">
+    How to validate generated PTX and diagnose launch errors.
+  </Card>
+</CardGroup>

@@ -1,0 +1,302 @@
+---
+title: "@kernel decorator and KernelWrapper API"
+description: "Complete reference for the @kernel decorator, KernelWrapper object, and differentiable_kernel helper — the core entry point for authoring pyptx PTX kernels."
+---
+
+The `@kernel` decorator is the primary entry point for authoring pyptx kernels. A decorated Python function is traced into PTX at call time and can be inspected as PTX text, compiled to SASS, or launched through JAX or PyTorch runtimes.
+
+```python
+from pyptx import kernel, Tile, Layout
+from pyptx.types import bf16, f32
+
+@kernel(
+    in_specs=(Tile("M", "K", bf16, Layout.ROW), Tile("K", "N", bf16, Layout.COL)),
+    out_specs=(Tile("M", "N", f32, Layout.ROW),),
+    grid=lambda M, N, K: (M // 128, N // 256),
+    block=(128, 1, 1),
+    cluster=(2, 1, 1),
+    arch="sm_90a",
+)
+def gemm(A, B, C, *, BM=128, BN=256, BK=64):
+    ...
+```
+
+## `@kernel` decorator
+
+`kernel` can be used with or without parentheses. When called with arguments it returns a `Kernel` wrapping the decorated function.
+
+```python
+from pyptx import kernel
+
+# Without arguments
+@kernel
+def simple(): ...
+
+# With arguments
+@kernel(arch="sm_100a", block=(128, 1, 1))
+def blackwell(): ...
+```
+
+### Parameters
+
+<ParamField path="in_specs" type="Sequence[Tile] | None" default="None">
+  Input tensor specs. Each positional argument that maps to a kernel input should have a corresponding `Tile`. Declares the dtype, shape, and layout expected for each input array.
+</ParamField>
+
+<ParamField path="out_specs" type="Sequence[Tile] | None" default="None">
+  Output tensor specs. Mirror of `in_specs` for output buffers. Required when calling the kernel through the JAX or PyTorch runtimes.
+</ParamField>
+
+<ParamField path="grid" type="Callable[..., tuple] | tuple | None" default="None">
+  CUDA grid dimensions. Pass a tuple `(gx, gy, gz)` for a static grid, or a callable that accepts symbolic shape variables and returns a tuple. The callable receives the merged shape environment resolved from the input arrays at call time.
+
+  ```python
+  # Static grid
+  grid=(8, 1, 1)
+
+  # Dynamic grid resolved from M, N
+  grid=lambda M, N, K: (M // 128, N // 256)
+  ```
+</ParamField>
+
+<ParamField path="block" type="tuple[int, int, int]" default="(1, 1, 1)">
+  CUDA block (CTA) dimensions. Static — must be a 3-tuple of ints.
+</ParamField>
+
+<ParamField path="cluster" type="tuple[int, int, int]" default="(1, 1, 1)">
+  CTA cluster dimensions for Hopper and later architectures. A cluster of `(2, 1, 1)` launches two CTAs that share an L2 cluster and can use cluster-scoped mbarrier operations.
+</ParamField>
+
+<ParamField path="arch" type="str" default='"sm_90a"'>
+  Target PTX architecture string. Controls which instructions are available and which PTX ISA version is emitted. Examples: `"sm_90a"` (Hopper), `"sm_100a"` (Blackwell).
+</ParamField>
+
+<ParamField path="smem" type="int" default="0">
+  Dynamic shared memory size in bytes. When the kernel's shared memory footprint exceeds 48 KB, set this to the total bytes and pyptx switches to `extern .shared .b8 dyn_smem[]` addressing automatically.
+</ParamField>
+
+<ParamField path="version" type="tuple[int, int] | None" default="None">
+  PTX ISA version as `(major, minor)`. Defaults to `(8, 5)` for Hopper targets and `(8, 8)` for Blackwell targets.
+</ParamField>
+
+<ParamField path="raw_params" type="Sequence[tuple[str, str]] | None" default="None">
+  Advanced: explicit `.param` declarations for transpiled kernels. Each entry is `(type_string, name)` where `type_string` encodes the full PTX type such as `"u64.ptr.global.palign1"` or `"u32"`.
+</ParamField>
+
+<ParamField path="extern_smem" type="bool | str" default="False">
+  When `True`, emits a top-level `extern .shared .b8 global_smem[];` declaration. Pass a string to use a custom symbol name instead of `"global_smem"`.
+</ParamField>
+
+<ParamField path="reqntid" type="tuple[int, ...] | None" default="None">
+  Emits a `.reqntid` directive in the PTX function body, asserting the block size to the assembler.
+</ParamField>
+
+<ParamField path="raw_directives" type="Sequence[tuple[str, tuple]] | None" default="None">
+  Arbitrary PTX function directives as `[(name, values), ...]`. Overrides `reqntid` when set.
+</ParamField>
+
+---
+
+## `Kernel` object
+
+The `@kernel` decorator returns a `Kernel` instance. The kernel's Python function is the body — keyword-only parameters are template parameters baked into the trace.
+
+```python
+def kernel_fn(A, B, C, *, BM=128, BK=64): ...
+#              ^^^^^^^^       ^^^^^^^^^^^
+#      positional = tensors   keyword-only = template params
+```
+
+### Properties
+
+<ResponseField name="arch" type="str">
+  Target architecture string, e.g. `"sm_90a"`.
+</ResponseField>
+
+<ResponseField name="in_specs" type="tuple[Tile, ...]">
+  Input tensor specs declared on the decorator.
+</ResponseField>
+
+<ResponseField name="out_specs" type="tuple[Tile, ...]">
+  Output tensor specs declared on the decorator.
+</ResponseField>
+
+<ResponseField name="block" type="tuple[int, int, int]">
+  Static CUDA block dimensions.
+</ResponseField>
+
+<ResponseField name="cluster" type="tuple[int, int, int]">
+  CTA cluster dimensions used at launch time.
+</ResponseField>
+
+<ResponseField name="grid" type="Callable | tuple | None">
+  Grid spec as declared on the decorator.
+</ResponseField>
+
+<ResponseField name="smem" type="int">
+  Requested dynamic shared memory size in bytes.
+</ResponseField>
+
+<ResponseField name="template_params" type="dict[str, Any]">
+  Keyword-only parameters from the function signature and their declared default values.
+</ResponseField>
+
+### Methods
+
+#### `.ptx(**kwargs) → str`
+
+Trace the kernel and return the emitted PTX as a string. Pass template kwargs (`BM`, `BN`, `BK`) and/or symbolic shape variables (`M`, `N`, `K`) to specialize. Defaults from the function signature fill in any unset values.
+
+```python
+print(gemm.ptx(M=4096, N=4096, K=4096))
+print(gemm.ptx(M=4096, N=4096, K=4096, BM=64))
+```
+
+#### `.sass(**kwargs) → str`
+
+Compile PTX to a cubin via `ptxas`, then disassemble to SASS via `cuobjdump`. Requires the CUDA toolkit in `PATH`. Raises `RuntimeError` with a helpful message if the toolkit is not found.
+
+```python
+print(gemm.sass(M=4096, N=4096, K=4096))
+```
+
+#### `.module(**kwargs) → Module`
+
+Return the internal IR `Module` object for programmatic inspection of the PTX AST.
+
+#### `__call__(*args, **kwargs)`
+
+Launch the kernel with concrete JAX arrays or PyTorch tensors. Positional args are the input arrays (matching `in_specs`). The kernel is JIT-compiled to a cubin on the first call for each unique input shape and cached thereafter.
+
+```python
+import jax
+import jax.numpy as jnp
+
+A = jnp.ones((4096, 4096), dtype=jnp.bfloat16)
+B = jnp.ones((4096, 4096), dtype=jnp.bfloat16)
+
+@jax.jit
+def fwd(a, b):
+    return gemm(a, b)
+
+result = fwd(A, B)
+```
+
+---
+
+## `TensorSpec`
+
+A placeholder for a tensor argument at trace time. Each positional parameter of a `@kernel` function receives a `TensorSpec` when the body is traced.
+
+```python
+@kernel(in_specs=(Tile("M", "K", bf16),), ...)
+def my_kernel(A, *, BM=128):
+    # A is a TensorSpec here
+    ptx.global_ptrs(A)
+```
+
+### Properties
+
+<ResponseField name="name" type="str">
+  The Python parameter name as declared in the function signature.
+</ResponseField>
+
+<ResponseField name="shape" type="tuple[int, ...] | None">
+  Concrete shape if it could be resolved from the shape environment, otherwise `None`.
+</ResponseField>
+
+<ResponseField name="dtype" type="PtxType | None">
+  Element type from the corresponding `Tile` spec.
+</ResponseField>
+
+<ResponseField name="layout" type="Layout | None">
+  Memory layout from the corresponding `Tile` spec.
+</ResponseField>
+
+### `.tma_desc() → Reg`
+
+Return a register holding the TMA descriptor pointer for this tensor. Calling this inside a kernel trace:
+
+1. Appends a `.param .u64 <name>_tma_desc` slot to the entry signature.
+2. Emits an `ld.param.u64` prologue to load the descriptor into a register (once per tensor, memoized).
+3. Returns the register for use as the `src` argument to `ptx.cp.async_.bulk.tensor_2d`.
+
+```python
+ptx.cp.async_.bulk.tensor_2d(
+    dst=sA[0],
+    src=A.tma_desc(),
+    coord=(x, y),
+    mbar=bar[0],
+)
+```
+
+---
+
+## `differentiable_kernel`
+
+Wrap a forward and backward pyptx kernel pair for `torch.autograd`.
+
+```python
+from pyptx import differentiable_kernel
+
+fwd_bwd = differentiable_kernel(forward_kernel, backward_kernel)
+result = fwd_bwd(x, w)
+result.sum().backward()
+```
+
+<ParamField path="forward_kernel" type="Kernel" required>
+  A `Kernel` instance implementing the forward pass.
+</ParamField>
+
+<ParamField path="backward_kernel" type="Kernel" required>
+  A `Kernel` instance implementing the backward pass. Its positional arguments should accept the input tensors followed by the output gradients.
+</ParamField>
+
+---
+
+## Complete example
+
+<CodeGroup>
+
+```python gemm kernel
+from pyptx import kernel, reg, smem, ptx, Tile, Layout
+from pyptx.types import bf16, f32, u32, u64, b64
+
+@kernel(
+    in_specs=(
+        Tile.wgmma_a("M", "K", bf16, tile_k=64),
+        Tile.wgmma_b("K", "N", bf16, tile_k=64),
+    ),
+    out_specs=(Tile("M", "N", f32, Layout.ROW),),
+    grid=lambda M, N, K: (M // 64, N // 256),
+    block=(128, 1, 1),
+    cluster=(1, 1, 1),
+    arch="sm_90a",
+)
+def gemm(A, B, C, *, BM=64, BN=256, BK=64):
+    px, pw, py = ptx.global_ptrs(A, B, C)
+
+    sA = smem.wgmma_tile(bf16, (BM, BK), major="K")
+    sB = smem.wgmma_tile(bf16, (BK, BN), major="MN")
+    bar = smem.mbarrier(1)
+
+    acc = reg.wgmma_frag(m=BM, n=BN, dtype=f32)
+    # ... kernel body ...
+    ptx.ret()
+```
+
+```python inspect ptx
+# Inspect PTX for a concrete specialization
+print(gemm.ptx(M=4096, N=4096, K=4096))
+```
+
+```python jax launch
+import jax, jax.numpy as jnp
+
+A = jnp.ones((4096, 4096), dtype=jnp.bfloat16)
+B = jnp.ones((4096, 4096), dtype=jnp.bfloat16)
+
+result = jax.jit(gemm)(A, B)
+```
+
+</CodeGroup>

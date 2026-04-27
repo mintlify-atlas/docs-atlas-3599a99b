@@ -1,0 +1,328 @@
+---
+title: "How pyptx Compiles Python to PTX: Five Stages"
+description: "A walkthrough of the pyptx compiler pipeline: trace, optimize, assemble, emit, and driver JIT — plus the inverse parse direction used by the transpiler."
+---
+
+When you call a `@kernel`-decorated function, pyptx traverses five compiler stages between your Python and `cuLaunchKernel`. There is no hidden optimizer or instruction scheduler — one Python call maps to one PTX instruction by construction. This page explains each stage and the IR that connects them.
+
+## Pipeline overview
+
+```text
+         ┌───────┐  ┌──────────┐  ┌──────────┐  ┌──────┐  ┌────────┐
+Python ─▶│ trace │─▶│ optimize │─▶│ assemble │─▶│ emit │─▶│ driver │─▶ SASS
+         └───────┘  └──────────┘  └──────────┘  └──────┘  └────────┘
+```
+
+| Stage | Input | Output | Source |
+| --- | --- | --- | --- |
+| **trace** | Python function body | `list[Statement]` | `pyptx/_trace.py` |
+| **optimize** | `list[Statement]` | `list[Statement]` | `pyptx/ir/optimize.py` |
+| **assemble** | statements + decls | `ir.Module` | `pyptx/kernel.py` |
+| **emit** | `ir.Module` | PTX source text | `pyptx/emitter/` |
+| **driver JIT** | PTX text | `CUfunction` | `cuModuleLoadData` via `cuda-python` |
+
+There is also an inverse direction used by the transpiler and round-trip tests:
+
+```text
+PTX text  ──▶  parse  ──▶  ir.Module   (pyptx/parser/)
+```
+
+The emitter (stage 4) and the parser are inverse functions over the same IR. All 218+ real PTX files in `tests/corpus/` round-trip byte-identically through `parse → emit`.
+
+---
+
+## Stage 1: Tracing
+
+The `@kernel` decorator does nothing at decoration time. It stores the Python function and arg specs, returns a callable wrapper, and waits. On the first call, the wrapper:
+
+1. Binds symbolic shape dims against the actual tensor shapes.
+2. Opens a `TraceContext`.
+3. Calls the Python function body — every `ptx.*` and `reg.*` call records an IR node.
+4. Hands the accumulated IR to stages 2–5.
+
+The entire tracing machinery lives in `pyptx/_trace.py` — 105 lines.
+
+### TraceContext
+
+```python
+class TraceContext:
+    def __init__(self, *, ptx_version: tuple[int, int] | None = None) -> None:
+        self.reg_decls: list[RegDecl] = []
+        self.var_decls: list[VarDecl] = []
+        self.statements: list[Statement] = []
+        self.ptx_version: tuple[int, int] | None = ptx_version
+        self._label_counter = 0
+        self._reg_counter: dict[str, int] = {}
+        self._if_stack: list[tuple[str, str]] = []
+        self.dyn_smem_offset: int = 0
+        self.force_dynamic_smem: bool = False
+        self._scope_depth: int = 0
+```
+
+The context maintains three buffers:
+
+- **`reg_decls`** — register declarations (`.reg .u32 %r<16>;`), hoisted to the top of the function body at emit time.
+- **`var_decls`** — variable declarations (`.shared .align 128 .b8 ...;`), also hoisted.
+- **`statements`** — instructions, labels, and inner scope blocks in emit order.
+
+PTX requires declarations before any instruction that uses them. Rather than thread that requirement into every DSL call, the tracer parks decls in a separate bucket and concatenates at emit time.
+
+### Thread-local activation
+
+The context lives in Python's `threading.local`, so multiple threads can trace independent kernels simultaneously:
+
+```python
+_local = threading.local()
+
+@contextmanager
+def trace_scope(*, ptx_version=None):
+    ctx = TraceContext(ptx_version=ptx_version)
+    old = getattr(_local, "ctx", None)
+    _local.ctx = ctx
+    try:
+        yield ctx
+    finally:
+        _local.ctx = old
+```
+
+`get_ctx()` retrieves the current context. If none is active, every `ptx.*` call raises immediately with a clear message — you can't accidentally emit instructions at module import time.
+
+### How `ptx.inst.mov.u32(...)` becomes an `Instruction` node
+
+Each call like:
+
+```python
+ptx.inst.mov.u32(x, ptx.special.tid.x())
+```
+
+resolves to a dispatch function in `pyptx/ptx.py` that:
+
+1. Pulls the active `TraceContext` via `get_ctx()`.
+2. Builds an `Instruction(opcode="mov", modifiers=(".u32",), operands=(...))`.
+3. Calls `ctx.emit(stmt)` to append it to `ctx.statements`.
+
+The `operands` tuple is assembled from the Python arguments: `Reg` objects become `RegisterOperand`, Python ints become `ImmediateOperand`, `ptx.addr(...)` calls become `AddressOperand`. The mapping is 1:1 — one Python call records one `Instruction` node.
+
+`reg.scalar(u32)` works slightly differently: it records a `RegDecl` via `ctx.emit_reg_decl(...)` and returns a `Reg` wrapper that knows its register name. Subsequent uses of that `Reg` reference the same name.
+
+### Control flow primitives
+
+Python-level control flow is traced:
+
+- `ptx.if_(pred)` / `ptx.else_()` / (close of `with`): emit `setp`/`bra`/`label` triples around the body, using fresh labels.
+- `ptx.loop("name", pred=...)`: emit a labeled backward branch.
+- Python `for i in range(n):` with a constant `n` is handled at the **Python level** — the loop body is traced `n` times, and the IR has no loop construct. This is how `for g in range(8):` in an epilogue unrolls to 8 copies of a store sequence.
+
+---
+
+## Stage 2: Optimize
+
+After tracing, the accumulated statements run through one semantics-preserving pass: **copy propagation**. Source is `pyptx/ir/optimize.py`, 150 lines.
+
+### Why it exists
+
+Operator overloading (`+`, `*`, `&`, `>>`) on `Reg` values creates a fresh temp register for each result. When you write:
+
+```python
+acc[5] = some_expression   # emits: mov.b32 acc[5], <temp>
+```
+
+`RegArray.__setitem__` intercepts the assignment and emits a `mov.b32 acc[5], %fresh_temp`. That extra `mov` is unnecessary — the expression result could have been written directly into `acc[5]`.
+
+Copy propagation removes it:
+
+1. Scan for `mov.bN %dst, %src` where `%src` is a fresh temp.
+2. Verify `%src` is defined once and used only by this mov.
+3. Rename `%src` → `%dst` in the definition, delete the mov, delete the `.reg` declaration for `%src`.
+
+The result is identical to what you'd get from writing `ptx.inst.*(acc[5], ...)` directly.
+
+### The only pass
+
+Copy propagation is the **only** post-trace optimization pass. There is no instruction scheduling, dead code elimination, constant folding, or register allocation. The design bet is that you're writing PTX and know what you want — the compiler shouldn't second-guess. Copy propagation is the narrow exception because `RegArray.__setitem__` genuinely emits an instruction you didn't ask for.
+
+---
+
+## Stage 3: Assemble the module
+
+The traced body goes into an `ir.Function`, which goes into an `ir.Module` (`pyptx/kernel.py`):
+
+```python
+module = Module(
+    version=Version(8, 4),
+    target=Target(("sm_90a",)),
+    address_size=AddressSize(64),
+    directives=(
+        Function(
+            is_entry=True,
+            name="tiny",
+            params=(...),          # built from in_specs/out_specs
+            body=body_statements,
+            directives=(
+                FunctionDirective("maxntid", (128, 1, 1)),
+            ),
+        ),
+    ),
+)
+```
+
+The `@kernel` decorator's kwargs (`block`, `grid`, `smem`, `arch`) become directives attached to the function. Dynamic SMEM exceeding 48 KB gets a `.extern .shared .align 128 .b8 dyn_smem[];` variable declaration, and flips a bit that the launch shim reads to call `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES, N)` before launching.
+
+---
+
+## The IR
+
+Before stage 4, it is worth understanding what the IR looks like.
+
+### Frozen dataclasses, tuple-valued collections
+
+Every IR node is a `@dataclass(frozen=True)`. Collections inside nodes are tuples, not lists. This means:
+
+- **Nodes are immutable.** You can't mutate a parsed kernel — you rebuild it with `dataclasses.replace(...)`.
+- **Nodes are hashable by structure.** `ir1 == ir2` is a deep structural comparison; `hash(ir1)` works.
+- **The IR is a value type.** Equality is "same shape, same fields," not pointer identity.
+
+The value-type design is load-bearing for round-trip testing: parse a kernel, emit it, parse the result, compare the IRs with `==`. If they match, the round-trip is lossless. The entire `tests/corpus/` (218+ real PTX files) is validated this way.
+
+### Statement nodes
+
+Core statement nodes that appear in a function body:
+
+| Node | Description |
+| --- | --- |
+| `Instruction` | One PTX instruction: `opcode`, `modifiers`, `operands`, optional `predicate` |
+| `Label` | A branch target |
+| `RegDecl` / `VarDecl` | Register and variable declarations |
+| `PragmaDirective` | `.pragma "..."` |
+| `Comment` / `BlankLine` | Preserved for formatting |
+| `RawLine` | Escape hatch for anything the parser can't structurally parse — emitted verbatim |
+| `Block` | A nested `{ ... }` scope |
+| `IntrinsicScope` | DSL wrapper around a named multi-instruction group |
+
+### Operand nodes
+
+| Node | Example |
+| --- | --- |
+| `RegisterOperand` | `%r0` |
+| `ImmediateOperand` | `42`, `0xFF`, `0d3FF0000000000000` |
+| `LabelOperand` | A label used as a branch target |
+| `VectorOperand` | `{%r0, %r1, %r2, %r3}` |
+| `AddressOperand` | `[base]` or `[base+offset]` |
+| `ParenthesizedOperand` | `(op1, op2, ...)` in call returns |
+| `NegatedOperand` | `!%p0` |
+| `PipeOperand` | `%p0|%p1` dual predicate output of `setp` |
+
+### FormattingInfo: the round-trip secret
+
+Each statement can carry a `FormattingInfo` with `indent`, `trailing`, `blank_lines_before`, `preceding_comments`, and `raw_line`. The parser fills these in when reading source; the emitter reproduces them exactly. When absent (trace output), the emitter uses sensible defaults.
+
+This is why `parse → emit` is byte-identical on the corpus. Without `FormattingInfo`, round-trip would be semantically correct but not byte-identical — the corpus contains real CUTLASS, Triton, DeepGEMM, and ThunderKittens output where irregular formatting is the rule, not the exception.
+
+---
+
+## Stage 4: Emit
+
+The IR-to-text path lives in `pyptx/emitter/emitter.py`, 405 lines. It is a visitor over `Module → Directive → Function → Statement → Operand`, with one `_emit_*` function per node type.
+
+The top-level entry point:
+
+```python
+def emit(module: Module) -> str:
+    if module.raw_source is not None:
+        return module.raw_source     # parsed-from-source shortcut
+    parts = []
+    # ...header + directives...
+    return "\n".join(parts) + "\n"
+```
+
+The `raw_source` shortcut is a round-trip optimization: if you parsed a module and didn't modify it, `emit` returns the original text directly. Only when you construct or modify IR does the emitter actually walk the tree.
+
+For an `Instruction`, the emitter produces:
+
+```text
+    [predicate] opcode[modifiers] operand0, operand1, ...;
+```
+
+`opcode + modifiers` are concatenated without spaces (`mov.b32`), operands are comma-separated, and the statement is terminated with `;`. `FormattingInfo`-specified leading indent and trailing comments are reproduced exactly.
+
+PTX is an assembly language — instruction, modifiers, operands, terminating semicolon. There's no nesting, no expression grammar, no type propagation. A visitor with one case per IR node type covers everything. The ~400 lines of `emitter.py` handle real CUTLASS and DeepGEMM output with no special cases.
+
+---
+
+## Stage 5: Driver JIT
+
+The emitted PTX text goes to NVIDIA's driver via `cuModuleLoadData`:
+
+```python
+module = cuda.cuModuleLoadData(ptx_bytes)
+fn = cuda.cuModuleGetFunction(module, entry_name)
+```
+
+The driver JITs PTX → SASS (NVIDIA's real machine code) at load time. The result is cached by `(ptx_string, arch)` so repeat calls don't retrigger the JIT.
+
+<Note>
+No `ptxas` is required at install time. No CUDA toolkit is needed beyond the driver. The `cuda-python` package provides the binding; the driver itself ships with the GPU.
+</Note>
+
+Launch is then `cuLaunchKernel(fn, grid_x, grid_y, grid_z, block_x, block_y, block_z, smem_bytes, stream, args, ...)`. JAX and PyTorch route through a small C++ shim at `pyptx/_shim/pyptx_launch.cc` so the call is issued on the correct framework stream.
+
+---
+
+## The reverse direction: parser
+
+`pyptx/parser/` turns PTX text back into IR. Three modules:
+
+- **`tokens.py`** — token types (77 lines).
+- **`lexer.py`** — source text → stream of tokens (327 lines).
+- **`parser.py`** — tokens → IR (1246 lines, recursive descent).
+
+The parser is **opcode-agnostic**. It doesn't distinguish `mov` from `wgmma.mma_async` — it parses the universal structure:
+
+```text
+[@predicate] opcode.modifier.modifier operand, operand, operand;
+```
+
+and produces an `Instruction` node with the right fields. This is why new ISA features (Blackwell `tcgen05.*`, future Thor instructions) parse correctly without any parser changes — they're just another opcode with modifiers.
+
+When the parser encounters something it can't structurally parse, it captures a `RawLine` and moves on. The emitter emits `RawLine` verbatim. The kernel remains valid IR; you just can't structurally modify that particular line without reparsing it yourself. The parser never crashes.
+
+### Byte-identical round-trip
+
+The test `tests/test_roundtrip.py` verifies:
+
+```python
+for path in corpus_files:  # 218+ real PTX files
+    text = path.read_text()
+    ir = parse(text)
+    emitted = emit(ir)
+    assert emitted == text   # byte-for-byte
+```
+
+This passes for CUTLASS kernels, Triton output, DeepGEMM, fast.cu, ThunderKittens examples, and Mamba-SSM kernels. The combination of `FormattingInfo` preservation, `raw_source` fallback, and `RawLine` escape hatch is what makes it possible.
+
+---
+
+## Spec validation
+
+A companion system in `pyptx/spec/` holds a declarative description of the PTX ISA — which modifiers combine, what operand types each opcode accepts, how many destinations vs sources — and validates `ptx.inst.*` calls against it at trace time.
+
+```python
+ptx.inst.mov.u32(x, y, z)   # three operands; mov takes two
+# → "mov.u32 expects 2 operands, got 3"
+```
+
+The spec (`pyptx/spec/ptx.py`, 930 lines) and validator (`validate.py`, 660 lines) catch errors before producing broken PTX that would only fail at `cuModuleLoadData` with a harder-to-debug driver error.
+
+---
+
+## Design rationale
+
+Five decisions, in order of impact:
+
+1. **Frozen-dataclass IR.** Makes the IR a value type: hashable, comparable by structure, immutable. Round-trip testing is `a == b`. Rewrites use `dataclasses.replace` — no mutation accidents.
+2. **FormattingInfo on every statement.** Enables byte-identical round-trip on real-world kernels with idiosyncratic formatting. It is a pointer-sized field on each node that most code ignores.
+3. **Opcode-agnostic parser.** New ISA features parse for free. The parser doesn't know about `tcgen05.mma` or any future instruction — it parses "opcode.modifiers operands;" and the IR holds the strings. The spec layer knows the semantics; the IR layer is ISA-blind.
+4. **One Python call = one Instruction node.** No lowering, no scheduler, no optimizer between trace and emit (except the one copy-propagation pass that removes `__setitem__` movs). You control instruction order; the compiler respects it.
+5. **Driver JIT, not ptxas.** No CUDA toolkit at install time. PTX strings go to `cuModuleLoadData`; the driver produces SASS. Every supported CUDA driver can load every PTX the emitter produces.
+
+The whole compiler — tracer + IR + optimizer + emitter + parser — is under 3000 lines of Python.

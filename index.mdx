@@ -1,133 +1,101 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
-icon: 'star'
+title: "pyptx: Python DSL for handwritten PTX on Hopper and Blackwell"
+description: "Write NVIDIA PTX kernels in Python with one call per instruction. Launch from JAX, PyTorch eager, and torch.compile on Hopper and Blackwell GPUs."
 ---
 
-## Setting up
+pyptx is a Python DSL for writing handcrafted PTX kernels targeting NVIDIA Hopper (sm\_90a) and Blackwell (sm\_100a) GPUs. Every `ptx.*` call emits exactly one PTX instruction — no compiler, no scheduler, no optimizer between your Python and the assembly it produces. The same kernel object runs from `jax.jit`, PyTorch eager, and `torch.compile`.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install pyptx with optional JAX or PyTorch runtime support
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Write, inspect, and run your first PTX kernel in minutes
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Guides" icon="book-open" href="/guides/first-kernel">
+    Step-by-step walkthroughs for real kernels on Hopper and Blackwell
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/kernel">
+    Complete reference for kernel, ptx, reg, smem, and types
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What pyptx does
 
-Everything you need to create world-class documentation.
+pyptx turns a Python function into a PTX assembly string. During tracing, `reg.*` allocates registers, `smem.*` describes shared-memory regions and barriers, and `ptx.*` records instructions. The result is PTX you can inspect before it ever touches the driver.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+```python
+from pyptx import kernel, reg, smem, ptx, Tile
+from pyptx.types import bf16, f32
 
-## Make your content agent ready
+@kernel(
+    in_specs=(Tile("M", "K", bf16), Tile("K", "N", bf16)),
+    out_specs=(Tile("M", "N", f32),),
+    grid=lambda M, N, K: (N // 64, M // 64),
+    block=(128, 1, 1),
+    arch="sm_90a",
+)
+def gemm(A, B, C):
+    sA = smem.wgmma_tile(bf16, (64, 16), major="K")
+    sB = smem.wgmma_tile(bf16, (16, 64), major="MN")
+    acc = reg.array(f32, 32)
+    # each ptx.* call emits exactly one PTX instruction
+    # ptx.wgmma.mma_async(shape=(64, 64, 16), ...)
 
-Make your docs work for humans and AI agents alike.
+print(gemm.ptx(M=4096, N=4096, K=4096))
+```
 
-<Columns cols={2}>
-  <Card
-    title="Prompt component"
-    icon="robot"
-    href="/agent-ready/prompt"
-  >
-    Embed shareable AI prompts readers can copy or open in Cursor.
-  </Card>
-  <Card
-    title="Visibility"
-    icon="eye"
-    href="/agent-ready/visibility"
-  >
-    Show different content to humans and agents reading your docs.
-  </Card>
-  <Card
-    title="Contextual menu"
-    icon="bolt"
-    href="/agent-ready/contextual"
-  >
-    Give readers one-click access to Claude, ChatGPT, Cursor, and more.
-  </Card>
-  <Card
-    title="AI coding tools"
-    icon="wand-magic-sparkles"
-    href="/ai-tools/claude-code"
-  >
-    Set up Claude Code, Cursor, or Windsurf with Mintlify's skill.
-  </Card>
-</Columns>
+## One kernel, three runtime paths
 
-## Need inspiration?
+```python
+# PyTorch eager
+out = gemm(a, b)
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+# torch.compile
+out = torch.compile(gemm)(a, b)
+
+# JAX jit
+out = jax.jit(gemm)(a, b)
+```
+
+## Key capabilities
+
+<CardGroup cols={2}>
+  <Card title="Hopper ISA" icon="microchip" href="/guides/handwritten-gemm">
+    WGMMA, TMA 2D/3D multicast, mbarriers, and cluster launch for sm_90a
+  </Card>
+  <Card title="Blackwell ISA" icon="microchip" href="/guides/blackwell-gemm">
+    tcgen05.mma, TMEM, SMEM descriptors, and 2-SM cooperative MMA for sm_100a
+  </Card>
+  <Card title="PTX transpiler" icon="arrows-rotate" href="/concepts/transpiler">
+    Convert nvcc, Triton, or Pallas PTX output to editable pyptx — byte-identical round-trip
+  </Card>
+  <Card title="Performance" icon="gauge-high" href="/concepts/performance">
+    815 TFLOPS on H100, 1240 TFLOPS on B200, with detailed benchmark tables
+  </Card>
+</CardGroup>
+
+## Getting started
+
+<Steps>
+  <Step title="Install pyptx">
+    ```bash
+    pip install pyptx
+    ```
+    Add runtime support for your framework:
+    ```bash
+    pip install 'pyptx[torch]'   # PyTorch eager + torch.compile
+    pip install 'pyptx[jax]'     # jax.jit via typed FFI
+    pip install 'pyptx[all]'     # both
+    ```
+  </Step>
+  <Step title="Write your first kernel">
+    Define a `@kernel` function using `reg`, `smem`, and `ptx` namespaces. Each `ptx.*` call emits exactly one PTX instruction.
+  </Step>
+  <Step title="Inspect the PTX">
+    Call `kernel.ptx()` to see the exact assembly your Python function produced before running it on hardware.
+  </Step>
+  <Step title="Launch from JAX or PyTorch">
+    Pass your kernel to `jax.jit`, `torch.compile`, or call it directly as a PyTorch eager op.
+  </Step>
+</Steps>

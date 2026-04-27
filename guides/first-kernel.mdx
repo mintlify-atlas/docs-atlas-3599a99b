@@ -1,0 +1,186 @@
+---
+title: "Writing Your First pyptx GPU Kernel"
+description: "Build a minimal pyptx kernel from scratch: the @kernel decorator, the reg/smem/ptx namespaces, register allocation, and how to inspect generated PTX."
+---
+
+pyptx kernels are traced Python functions. You write structured Python, the DSL records every register allocation and instruction, and `kernel.ptx()` hands you back the raw PTX string ready to JIT-compile. This page walks through the smallest useful kernel step by step.
+
+## The Three Namespaces
+
+Every pyptx kernel is some mix of three modules:
+
+<CardGroup cols={3}>
+  <Card title="reg" icon="memory">
+    Allocate and manipulate PTX registers. Arithmetic operators on `Reg` objects emit PTX instructions immediately.
+  </Card>
+  <Card title="smem" icon="share-nodes">
+    Allocate shared-memory regions, WGMMA tiles, and mbarrier arrays.
+  </Card>
+  <Card title="ptx" icon="microchip">
+    Emit instructions (`ptx.inst.*`), control flow (`ptx.if_`, `ptx.loop`), special registers, and low-level GPU operations.
+  </Card>
+</CardGroup>
+
+If you understand those three namespaces, you understand the shape of the library.
+
+## Building the Kernel
+
+<Steps>
+  <Step title="Import and define">
+    Start by importing the three namespaces and the types you need.
+
+    ```python
+    from pyptx import kernel, reg, ptx
+    from pyptx.types import u32
+    ```
+
+    The `@kernel` decorator is how you declare a GPU kernel. At minimum it takes an `arch` string — `"sm_90a"` for Hopper or `"sm_100a"` for Blackwell.
+  </Step>
+
+  <Step title="Allocate a register with reg.from_">
+    Inside the kernel body, `reg.from_` is the quickest way to stage a hardware special register into a named PTX register.
+
+    ```python
+    @kernel(arch="sm_90a")
+    def tiny():
+        tid = reg.from_(ptx.special.tid.x(), u32)
+    ```
+
+    This emits one `mov.u32` instruction and returns a `Reg` object. The declaration is automatically hoisted to the top of the function body in the emitted PTX — you don't need to declare registers before you use them.
+  </Step>
+
+  <Step title="Use arithmetic operators on Reg objects">
+    Python arithmetic operators on `Reg` objects emit PTX instructions directly into the trace. Each operator is exactly one instruction — `+` is `add`, `*` is `mul`, `<<` is `shl`, and so on.
+
+    ```python
+    @kernel(arch="sm_90a")
+    def tiny():
+        tid = reg.from_(ptx.special.tid.x(), u32)
+        out = tid + 4       # emits: add.u32 %r1, %r0, 4
+    ```
+
+    Integer arithmetic stays in 32-bit by default. For pointer offset math on 64-bit addresses, the operators automatically widen to 64-bit.
+  </Step>
+
+  <Step title="Emit instructions with ptx.inst.*">
+    For anything beyond simple arithmetic — typed MOVs, typed loads and stores, special operations — use `ptx.inst.*`. The dotted namespace mirrors PTX instruction syntax directly.
+
+    ```python
+    @kernel(arch="sm_90a")
+    def tiny():
+        tid = reg.from_(ptx.special.tid.x(), u32)
+        out = tid + 4
+        ptx.inst.mov.u32(tid, out)   # move out back into tid
+        ptx.ret()
+    ```
+
+    `ptx.ret()` ends the kernel exactly where you write it. The trace stops recording at that point.
+  </Step>
+
+  <Step title="Inspect the generated PTX">
+    After decoration, call `.ptx()` on the kernel object to get the PTX string.
+
+    ```python
+    print(tiny.ptx())
+    ```
+
+    Output:
+
+    ```ptx
+    .version 8.0
+    .target sm_90a
+    .address_size 64
+
+    .visible .entry tiny() {
+        .reg .u32 %r<2>;
+
+        mov.u32 %r0, %tid.x;
+        add.s32 %r1, %r0, 4;
+        mov.u32 %r0, %r1;
+        ret;
+    }
+    ```
+
+    The `.reg` declarations are hoisted automatically. Instruction order matches your Python source order exactly.
+  </Step>
+</Steps>
+
+## The Complete Kernel
+
+```python
+from pyptx import kernel, reg, ptx
+from pyptx.types import u32
+
+@kernel(arch="sm_90a")
+def tiny():
+    tid = reg.from_(ptx.special.tid.x(), u32)
+    out = tid + 4
+    ptx.inst.mov.u32(tid, out)
+    ptx.ret()
+
+print(tiny.ptx())
+```
+
+## reg.scalar vs reg.from_ vs reg.array
+
+The `reg` module has three main allocation functions:
+
+| Function | What it does | When to use it |
+|---|---|---|
+| `reg.scalar(dtype)` | Allocates a single register, no initializer | Most registers |
+| `reg.scalar(dtype, init=value)` | Allocates + emits a `mov` with a constant | Loop counters, FP constants |
+| `reg.from_(src, dtype)` | Allocates + emits a `mov` from `src` | Special registers, SMEM base |
+| `reg.array(dtype, count)` | Allocates a `%name<count>` register array | Accumulators, vector loads |
+
+```python
+# Allocate a scalar f32, initialized to 0.0
+sum_sq = reg.scalar(f32, init=0.0)
+
+# Allocate a scalar predicate register
+is_lane_zero = reg.scalar(pred)
+
+# Stage %tid.x into a u32 register
+tid = reg.from_(ptx.special.tid.x(), u32)
+
+# Allocate 32 f32 accumulator registers for WGMMA
+acc = reg.array(f32, 32)
+# Access individual elements: acc[0], acc[1], ...
+```
+
+## Predicate Registers and Conditional Code
+
+Comparison operators on `Reg` objects emit `setp` instructions and return `pred` registers. Use them with `ptx.if_`:
+
+```python
+lane = tid & 31             # setp not needed yet; this is a Reg
+is_lane_zero = lane == 0   # emits: setp.eq.u32 %p0, %r_lane, 0
+
+with ptx.if_(is_lane_zero):
+    # code here runs only when the predicate is true
+    ptx.inst.mov.u32(some_reg, 42)
+```
+
+Negated predicates work with the `~` operator:
+
+```python
+with ptx.if_(~is_lane_zero):
+    # runs for all lanes except lane 0
+    ...
+```
+
+## What To Read Next
+
+<CardGroup cols={2}>
+  <Card title="Registers and Shared Memory" href="/guides/registers-and-smem">
+    Deep dive into reg.scalar, reg.array, smem.alloc, and smem.mbarrier.
+  </Card>
+  <Card title="RMS Norm Walkthrough" href="/guides/rms-norm">
+    The simplest real kernel — v4 loads, warp reduce, 2.6 TB/s on H100.
+  </Card>
+  <Card title="Tiles, Layouts, and TMA" href="/guides/tiles-layouts-tma">
+    in_specs, out_specs, TMA descriptors, and swizzle matching.
+  </Card>
+  <Card title="Debugging" href="/guides/debugging">
+    How to inspect PTX, validate with ptxas, and diagnose common errors.
+  </Card>
+</CardGroup>

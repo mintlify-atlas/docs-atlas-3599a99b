@@ -1,0 +1,290 @@
+---
+title: "Blackwell tcgen05 GEMM: 1240 TFLOPS on B200"
+description: "How pyptx implements the Blackwell sm_100a GEMM: tcgen05.mma, TMEM allocation, SMEM instruction descriptors, 4-stage ring buffers, and the 2-SM cta_group::2 variant."
+---
+
+The Blackwell GEMM in `examples/blackwell/gemm_highperf_blackwell.py` is implemented end-to-end in the pyptx DSL. The 1-SM variant reaches **1240 TFLOPS on B200** at 8192³ bf16. The repo also ships a 2-SM `cta_group::2` variant that peaks at 1268 TFLOPS on selected shapes.
+
+Blackwell introduces a completely different tensor-core path from Hopper's WGMMA. Before reading the kernel, you need four concepts:
+
+1. **`tcgen05.mma`** — issued by one thread per CTA instead of a 128-thread warpgroup.
+2. **TMEM** — a new memory space, separate from SMEM and registers, that holds the MMA accumulator.
+3. **SMEM + instruction descriptors** — compact 64-bit values that encode operand layout for tcgen05.
+4. **Warp specialization** — dedicated TMA warp and MMA warp with mbarrier handoff.
+
+Read [Hopper GEMM](/guides/handwritten-gemm) first if you haven't — this guide assumes you know the WGMMA + TMA + mbarrier loop.
+
+## What the Kernel Computes
+
+Standard GEMM: `D[M, N] = A[M, K] @ B[N, K].T`, A and B in bf16, D in f32.
+Tile sizes: `BM=128, BN=256, BK=64`, `k_per_instr=16` → 4 tcgen05 MMAs per outer K-tile.
+
+The repo also ships `build_gemm_2sm` which dispatches `tcgen05.mma.cta_group::2` across a 2-CTA cluster — two SMs cooperate on one tile. This guide covers both.
+
+## The Four New Primitives
+
+### tcgen05.mma — One Thread Issues the Whole MMA
+
+On Hopper, every warpgroup (128 threads) executes the same `wgmma` instruction. On Blackwell, **one thread** issues the MMA for the entire CTA:
+
+```python
+ptx.tcgen05.mma(
+    tmem_base, desc_a, desc_b, idesc,
+    kind="f16",
+    pred_operand=(not is_first),   # scale_d equivalent
+)
+```
+
+The result accumulates into TMEM, not the issuing thread's registers. Because only one thread issues the MMA, warp specialization is natural: dedicate warp 1 lane 0 to MMA dispatch, free the other warps for TMA and epilogue work.
+
+### TMEM — The Third Memory Space
+
+TMEM is separate from both registers and SMEM. Its lifetime must be explicitly managed:
+
+```python
+# Allocate: reserves 512 accumulator columns
+ptx.tcgen05.alloc(tmem_slot, 512)
+
+# Read base address (stored in SMEM by the alloc call):
+tmem_base = smem.load(b32, ptx.addr(tmem_slot))
+
+# After all K-tiles, load from TMEM into registers:
+out = reg.array(b32, 128)
+ptx.tcgen05.ld(
+    [out[i] for i in range(128)],
+    tmem_addr,
+    shape="32x32b", count=128, dtype="b32",
+)
+ptx.tcgen05.wait_ld()
+
+# Cleanup (must be called by the same warp that allocated):
+ptx.tcgen05.dealloc(tmem_base, 512)
+ptx.tcgen05.relinquish_alloc_permit()
+```
+
+<Warning>
+Forgetting to dealloc TMEM causes the next kernel launch on the same SM to fail. The `dealloc` + `relinquish_alloc_permit` pair must be called by the same warp that called `alloc`.
+</Warning>
+
+### SMEM and Instruction Descriptors
+
+Each `tcgen05.mma` takes three descriptors:
+
+- **desc_a**: 64-bit value encoding A's SMEM base, stride, and swizzle pattern.
+- **desc_b**: same for B.
+- **idesc**: instruction descriptor encoding MMA shape, dtype, and hardware flags. Built once:
+
+```python
+idesc = reg.scalar(b32, init=ptx.tcgen05.make_instr_desc_f16bf16_f32())
+```
+
+SMEM descriptors are built from a constant mask plus the SMEM pointer:
+
+```python
+MMA_DESC_B128 = 0x4000404000010000
+desc_a0 = ptx.tcgen05.masked_descriptor(smem_a, const_bits=MMA_DESC_B128)
+desc_b0 = ptx.tcgen05.masked_descriptor(smem_b, const_bits=MMA_DESC_B128)
+```
+
+Inside a K-tile, successive 16-wide MMA slices advance the descriptor by a constant byte offset — the canonical "walk the K dimension in descriptors" trick:
+
+```python
+for kk in range(MMAS_PER_KTILE):  # MMAS_PER_KTILE = BK / K_PER_INSTR = 4
+    if kk == 0:
+        desc_a, desc_b = desc_a0, desc_b0
+    else:
+        desc_a = reg.scalar(b64)
+        desc_b = reg.scalar(b64)
+        ptx.inst.add.s64(desc_a, desc_a0, kk * 2)
+        ptx.inst.add.s64(desc_b, desc_b0, kk * 2)
+```
+
+`+ kk * 2` walks the descriptor's address bits to advance by one 16-wide K-slice. This is descriptor arithmetic, not pointer arithmetic.
+
+## SMEM Layout
+
+Everything is hand-placed — no SMEM allocator, just offset arithmetic:
+
+```python
+STAGES = 4
+A_STAGE = BM * BK * 2   # 16 KB per A stage
+B_STAGE = BN * BK * 2   # 32 KB per B stage
+
+SMEM_A_BASE       = 0
+SMEM_B_BASE       = SMEM_A_BASE + STAGES * A_STAGE      # 64 KB
+SMEM_BAR_LOAD     = SMEM_B_BASE + STAGES * B_STAGE      # 192 KB
+SMEM_BAR_CONSUMED = SMEM_BAR_LOAD + STAGES * 8
+SMEM_BAR_MMA      = SMEM_BAR_CONSUMED + STAGES * 8
+SMEM_TMEM_SLOT    = SMEM_BAR_MMA + 8
+SMEM_BYTES        = SMEM_TMEM_SLOT + 16                 # ~192 KB+
+```
+
+192 KB+ of dynamic SMEM — well beyond the 48 KB static limit. The kernel uses `extern_smem=True` and the framework calls `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES, SMEM_BYTES)` at launch.
+
+## Hilbert-Curve Tile Scheduling
+
+The kernel doesn't walk tiles row-major. It groups tiles into `grid_tile_width` sub-groups and alternates inner direction:
+
+```python
+ptx.inst.div.u32(group_id, tile_linear, group_span)
+ptx.inst.rem.u32(group_offset, tile_linear, group_span)
+is_odd_group = (group_id & 1) != 0
+tile_minor = selp(minor_rev, minor_fwd, is_odd_group)
+```
+
+Space-filling traversal for L2 locality — tiles close in time are close in the output, keeping A/B rows hot in L2. Worth 5–10% over plain row-major tile scheduling on large GEMMs.
+
+## The Producer Warp
+
+```python
+with ptx.if_(is_tma_warp):
+    for ki in range(k_iters):
+        slot = ki % STAGES
+        mbar_l = bar_load + slot * 8
+        mbar_c = bar_consumed + slot * 8
+
+        if ki >= STAGES:
+            # Slot reuse: spin until MMA frees this slot
+            consumed_phase = ((ki // STAGES) - 1) & 1
+            with ptx.scope():
+                ready = reg.scalar(pred)
+                ptx.label(f"cwait_{ki}")
+                ptx.inst.mbarrier.try_wait.parity.shared__cta.b64(
+                    ready, ptx.addr(mbar_c), consumed_phase
+                )
+                ptx.bra(f"cdone_{ki}", pred=ready)
+                ptx.bra(f"cwait_{ki}")
+                ptx.label(f"cdone_{ki}")
+
+        ptx.mbarrier.arrive_expect_tx(mbar_l, A_STAGE + B_STAGE)
+        ptx.cp.async_.bulk.tensor_2d(
+            dst=smem_a, src=A.tma_desc(),
+            coord=(ki * BK, m_base), mbar=mbar_l,
+        )
+        ptx.cp.async_.bulk.tensor_2d(
+            dst=smem_b, src=B_T.tma_desc(),
+            coord=(ki * BK, n_base), mbar=mbar_l,
+        )
+```
+
+The producer warp only moves bytes. It waits for MMA to free slots before refilling them.
+
+## The Consumer Warp
+
+```python
+with ptx.if_(is_mma_warp):
+    for ki in range(k_iters):
+        slot = ki % STAGES
+        load_phase = (ki // STAGES) & 1
+
+        # Wait for TMA to finish this slot
+        with ptx.scope():
+            ready = reg.scalar(pred)
+            ptx.label(f"lwait_{ki}")
+            ptx.inst.mbarrier.try_wait.parity.shared__cta.b64(
+                ready, ptx.addr(mbar_l), load_phase
+            )
+            ptx.bra(f"ldone_{ki}", pred=ready)
+            ptx.bra(f"lwait_{ki}")
+            ptx.label(f"ldone_{ki}")
+
+        # Build descriptors and issue 4 MMAs per K-tile
+        desc_a0 = ptx.tcgen05.masked_descriptor(smem_a, const_bits=MMA_DESC_B128)
+        desc_b0 = ptx.tcgen05.masked_descriptor(smem_b, const_bits=MMA_DESC_B128)
+        for kk in range(MMAS_PER_KTILE):
+            is_first = (ki == 0 and kk == 0)
+            ptx.tcgen05.mma(
+                tmem_base, desc_a, desc_b, idesc,
+                kind="f16", pred_operand=(not is_first),
+            )
+
+        ptx.mbarrier.arrive(mbar_c)   # slot is free to refill
+
+    ptx.tcgen05.commit(bar_mma, space="cluster")
+```
+
+`pred_operand=(not is_first)` is the scale-D equivalent. On the very first MMA (`ki=0, kk=0`), treat the accumulator as fresh. Every subsequent MMA accumulates.
+
+## The Epilogue — TMEM to Global Memory
+
+```python
+# All threads wait for MMA commit
+# ... try_wait.parity spin on bar_mma, phase=0 ...
+
+# Each thread T owns output rows m_base + T
+tmem_row_bits = (tid << 16) & 0x3E00000
+tmem_addr = tmem_base + tmem_row_bits
+
+out = reg.array(b32, 128)
+for chunk in range(BN // 128):   # BN=256 → 2 chunks
+    chunk_off = chunk * 128
+    ptx.tcgen05.ld(
+        [out[i] for i in range(128)],
+        tmem_addr + chunk_off,
+        shape="32x32b", count=128, dtype="b32",
+    )
+    ptx.tcgen05.wait_ld()
+
+    for vec in range(128 // 4):
+        off = (chunk_off + vec * 4) * 4
+        ptx.inst.st.global_.v4.b32(
+            ptx.addr(d_ptr, off),
+            [out[vec*4], out[vec*4+1], out[vec*4+2], out[vec*4+3]],
+        )
+```
+
+TMEM → registers → HBM is the required path. Blackwell has no direct TMEM → HBM store. The TMEM address formula `(tid << 16) & 0x3E00000` packs the "data path" index into the right TMEM address bits — thread T reads the accumulator row at `m_base + T`.
+
+## The 2-SM Variant
+
+`build_gemm_2sm` extends the 1-SM kernel with `cta_group::2`:
+
+<Tabs>
+  <Tab title="1-SM (default)">
+    - One CTA, one SM, `BM=128, BN=256`
+    - 4-stage SMEM ring buffer
+    - `tcgen05.mma` covers one 128×256 output tile
+    - `tcgen05.commit(bar_mma, space="cluster")`
+  </Tab>
+  <Tab title="2-SM (cta_group::2)">
+    - Two CTAs in a cluster, two SMs
+    - Each SM holds its own half of B, both share A
+    - MMA warp in SM-A dispatches for the whole cluster
+    - 5-stage buffer (`STAGES_2SM = 5`) to hide cross-SM sync
+    - Both SMs share one `bar_mma` cluster barrier
+    - Larger effective tile size with fewer MMA issue overhead
+  </Tab>
+</Tabs>
+
+## Primitive Summary
+
+The Blackwell-only feature set exposed as first-class pyptx calls:
+
+| Primitive | Purpose |
+|---|---|
+| `ptx.tcgen05.alloc(slot, 512)` | Reserve TMEM columns |
+| `ptx.tcgen05.mma(tmem, desc_a, desc_b, idesc, kind="f16", ...)` | Issue async MMA into TMEM |
+| `ptx.tcgen05.commit(bar, space="cluster")` | Signal MMA completion |
+| `ptx.tcgen05.ld(regs, addr, shape, count, dtype)` | Load TMEM slice into registers |
+| `ptx.tcgen05.wait_ld()` | Synchronize after tcgen05.ld |
+| `ptx.tcgen05.dealloc(base, 512)` | Release TMEM |
+| `ptx.tcgen05.relinquish_alloc_permit()` | Hand back allocation capability |
+| `ptx.tcgen05.make_instr_desc_f16bf16_f32()` | Build instruction descriptor constant |
+| `ptx.tcgen05.masked_descriptor(smem_ptr, const_bits=...)` | Build SMEM descriptor |
+
+## What To Read Next
+
+<CardGroup cols={2}>
+  <Card title="Hopper GEMM" href="/guides/handwritten-gemm">
+    The WGMMA analog — simpler warp specialization and no TMEM.
+  </Card>
+  <Card title="Mbarriers and Async Sync" href="/guides/mbarriers">
+    Full reference for the try_wait.parity pattern and ring buffer synchronization.
+  </Card>
+  <Card title="Tiles, Layouts, and TMA" href="/guides/tiles-layouts-tma">
+    How Layout.TMA_128B and tma_box connect to the Blackwell descriptor.
+  </Card>
+  <Card title="Debugging" href="/guides/debugging">
+    TMEM lifetime errors, illegal memory access, and kernel hang diagnosis.
+  </Card>
+</CardGroup>

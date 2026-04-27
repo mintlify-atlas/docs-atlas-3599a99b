@@ -1,0 +1,278 @@
+---
+title: "Registers and Shared Memory in pyptx"
+description: "Complete reference for reg.scalar, reg.array, reg.from_, reg.pred, arithmetic operators on Reg objects, smem.alloc, smem.wgmma_tile, and smem.mbarrier."
+---
+
+The `reg` and `smem` modules are the two allocation layers every pyptx kernel starts with. `reg` owns everything that lives in thread-private registers; `smem` owns everything that lives in the shared-memory address space. This page is a reference for both.
+
+## Register Allocation
+
+### reg.scalar
+
+`reg.scalar(dtype)` allocates a single PTX register of the given type. The declaration is hoisted to the top of the function body automatically — you never write `.reg` by hand.
+
+```python
+from pyptx import reg, ptx
+from pyptx.types import u32, f32, pred, b64
+
+tid  = reg.scalar(u32)          # .reg .u32 %r0;
+acc  = reg.scalar(f32)          # .reg .f32 %f0;
+p    = reg.scalar(pred)         # .reg .pred %p<N>;  (shared pool)
+ptr  = reg.scalar(b64)          # .reg .b64 %rd0;
+```
+
+Pass `init=` to emit a `mov` immediately after the declaration:
+
+```python
+zero  = reg.scalar(f32, init=0.0)   # mov.f32 %f0, 0f00000000;
+inv_n = reg.scalar(f32, init=1.0/N) # mov.f32 %f1, 0f3A800000;  (1/1024)
+count = reg.scalar(u32, init=0)     # mov.u32 %r0, 0;
+```
+
+Float types (`f32`, `f64`) accept a Python `float` for `init`. pyptx encodes it to PTX's `0fXXXXXXXX` / `0dXXXXXXXX...` hex form automatically. There is no float literal syntax for `f16` or `bf16` — for those, initialize a `b16` integer and convert.
+
+### reg.array
+
+`reg.array(dtype, count)` declares a `.reg .type %name<count>;` bulk register array. Index it to get individual `Reg` objects:
+
+```python
+acc    = reg.array(f32, 32)    # .reg .f32 %f<32>;
+x_vals = reg.array(f32, 16)    # .reg .f32 %farr0_<16>;
+
+first  = acc[0]                # Reg('%f0', f32)
+last   = acc[31]               # Reg('%f31', f32)
+```
+
+Arrays are iterable and have a `.count` property:
+
+```python
+for r in acc:
+    ptx.inst.mov.f32(r, zero)   # zero-fill each register
+```
+
+The `reg.wgmma_frag` shortcut sizes a fragment array for a dense WGMMA shape:
+
+```python
+# For m64n64k16: 64*64/128 = 32 f32 registers per thread
+acc = reg.wgmma_frag(m=64, n=64, dtype=f32)
+```
+
+### reg.from_
+
+`reg.from_(src, dtype)` is the common prologue pattern — allocate a register and immediately `mov` a value into it. `src` can be a special register or a string symbol name.
+
+```python
+tid  = reg.from_(ptx.special.tid.x(),   u32)   # mov.u32 %r0, %tid.x;
+cta  = reg.from_(ptx.special.ctaid.x(), u32)   # mov.u32 %r1, %ctaid.x;
+base = reg.from_("smem", u32)                  # mov.b32 %r2, smem;
+```
+
+### Predicate Registers
+
+Predicates are produced automatically when you use comparison operators on integer `Reg` objects:
+
+```python
+lane        = tid & 31           # and.b32
+is_zero     = lane == 0          # setp.eq.u32 → Reg(pred)
+is_nonzero  = lane != 0          # setp.ne.u32 → Reg(pred)
+is_small    = lane < 8           # setp.lt.u32 → Reg(pred)
+```
+
+Negated predicates use `~`:
+
+```python
+with ptx.if_(~is_zero):
+    ...
+```
+
+Allocate a `pred` register explicitly when you need to fill it with `setp` later:
+
+```python
+ready = reg.scalar(pred)
+ptx.inst.setp.lt.u32(ready, tid, 32)
+```
+
+## Arithmetic Operators on Reg Objects
+
+Python arithmetic operators on `Reg` objects emit exactly one PTX instruction each. This is not an expression-tree builder — each `+` is immediately an `add` instruction in the trace.
+
+<Tabs>
+  <Tab title="Integer (u32/s32)">
+    ```python
+    a = reg.scalar(u32, init=4)
+    b = reg.scalar(u32, init=2)
+
+    c = a + b       # add.u32  %r2, %r0, %r1
+    d = a - b       # sub.s32  %r3, %r0, %r1
+    e = a * b       # mul.lo.s32 %r4, %r0, %r1
+    f = a << 3      # shl.b32  %r5, %r0, 3
+    g = a >> 2      # shr.u32  %r6, %r0, 2
+    h = a & 31      # and.b32  %r7, %r0, 31
+    i = a ^ 0xFF    # xor.b32  %r8, %r0, 255
+    j = a.max(b)    # max.u32  %r9, %r0, %r1
+    ```
+  </Tab>
+  <Tab title="Pointer (b64/u64)">
+    ```python
+    # px is a b64 base pointer
+    px = reg.scalar(b64)
+    ptx.inst.ld.param.u64(px, ptx.param_ptr("X"))
+
+    # Pointer arithmetic → add.s64 (what ptxas expects for pointer offsets)
+    px2 = px + 128          # add.s64 %rd1, %rd0, 128
+    px3 = px + some_u64_reg # add.s64 %rd2, %rd0, %rd_off
+
+    # u32 → automatically widened to 64-bit before add
+    off_u32 = row * (N * 4)   # mul.lo.s32 → u32
+    px4 = px + off_u32        # cvt.u64.u32 + add.s64
+    ```
+  </Tab>
+  <Tab title="In-place operators">
+    In-place operators (`+=`, `-=`, `*=`, `<<=`, etc.) write back to the same register — no new register allocated:
+
+    ```python
+    ptr = reg.scalar(b64)
+    ptx.inst.ld.param.u64(ptr, ptx.param_ptr("X"))
+
+    ptr += 64       # add.s64 %rd0, %rd0, 64  (same register)
+    ptr += off      # add.s64 %rd0, %rd0, %rd_off
+    ```
+
+    This is the canonical "pointer bump" pattern used in every streaming kernel.
+  </Tab>
+</Tabs>
+
+<Note>
+Float arithmetic is **not** covered by operator overloads. For `f32` / `f64` math, use `ptx.inst.add.f32(...)`, `ptx.inst.mul.f32(...)`, etc. This is intentional: the choice between `add.f32`, `add.rn.f32`, `add.sat.f32`, or `fma.rn.f32` matters, and hiding it would obscure the instruction count.
+</Note>
+
+## Shared Memory
+
+### smem.alloc
+
+`smem.alloc(dtype, shape)` allocates a named static shared-memory region. The declaration is emitted as `.shared .align 128 .b8 smem_N[bytes];`.
+
+```python
+from pyptx import smem
+from pyptx.types import f32, bf16
+
+# 2D scratch buffer: 16 warps × 1 f32 partial per warp
+partials = smem.alloc(f32, (16, 1))
+
+# 3D staging: STAGES × BM × BK bf16 elements
+sA = smem.alloc(bf16, (STAGES, BM, BK))
+```
+
+2D allocations support `[row, col]` indexing that emits `ld.shared` and `st.shared`:
+
+```python
+# Load: emits ld.shared.f32
+val = partials[warp_id, 0]
+
+# Store: emits st.shared.f32
+partials[warp_id, 0] = sum_sq
+```
+
+<Warning>
+2D indexing assumes naive row-major layout. It does **not** apply WGMMA swizzle modes. Use it for scratch buffers (partials, stats, mbarrier staging). For WGMMA operand tiles, use `smem.wgmma_tile` instead.
+</Warning>
+
+### smem.wgmma_tile
+
+`smem.wgmma_tile(dtype, shape, major)` allocates a shared-memory tile in the canonical GMMA layout for `wgmma.mma_async` or `tcgen05.mma`. It picks the right swizzle, alignment, and descriptor metadata automatically.
+
+```python
+# A operand: K-major (K is the inner/contiguous dimension)
+sA = smem.wgmma_tile(bf16, (BM, tile_k), major="K")
+
+# B operand: MN-major (N is the inner dimension)
+sB = smem.wgmma_tile(bf16, (tile_k, BN), major="MN")
+```
+
+The `major` parameter controls which axis is contiguous in the SMEM layout:
+
+| `major` | Operand | Contiguous axis | Typical use |
+|---|---|---|---|
+| `"K"` | A | K dimension | A tile for WGMMA |
+| `"MN"` | B | N dimension | B tile for WGMMA |
+
+The returned `SharedAlloc` carries a `.gmma_layout` attribute used by `ptx.wgmma.mma_async` to auto-build the 64-bit WGMMA descriptor. You never need to set LBO/SBO or swizzle mode manually when using this function.
+
+**Swizzle modes picked automatically:**
+
+| Row width (bytes) | Swizzle | Example |
+|---|---|---|
+| 16 | None (INTERLEAVE) | bf16, K=8 |
+| 32 | B32 | bf16, K=16 |
+| 64 | B64 | bf16, K=32 |
+| ≥128 | B128 | bf16, K≥64 |
+
+### Dynamic Shared Memory
+
+For kernels needing more than 48 KB of shared memory, declare the budget on the `@kernel` decorator:
+
+```python
+@kernel(arch="sm_90a", smem=217648)
+def gemm(...):
+    sA = smem.wgmma_tile(bf16, (BM, BK), major="K")
+    sB = smem.wgmma_tile(bf16, (BK, BN), major="MN")
+    # all alloc/mbarrier calls auto-use offset-based dyn_smem addressing
+```
+
+In dynamic mode, all `smem.alloc` and `smem.mbarrier` calls share a single `extern .shared .b8 dyn_smem[]` declaration. The framework calls `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES, smem)` at launch.
+
+### smem.mbarrier
+
+`smem.mbarrier(count)` allocates an array of mbarrier objects in shared memory. Each mbarrier is 8 bytes. Index the array to get `MbarrierRef` objects for use in `ptx.mbarrier.*` calls.
+
+```python
+# Single mbarrier (one TMA per K-slice)
+bar = smem.mbarrier(1)
+ptx.mbarrier.init(bar[0], 1)
+
+# Array of N mbarriers (one per K-iteration for pre-issued loads)
+bars = [smem.mbarrier(1) for _ in range(n_iters)]
+
+# Multi-stage ring buffer (STAGES barriers for loads + consumed)
+bar_load     = smem.mbarrier(STAGES)
+bar_consumed = smem.mbarrier(STAGES)
+```
+
+See [Mbarriers and Async Sync](/guides/mbarriers) for the full producer/consumer pattern.
+
+## GMMA Swizzle Helpers
+
+When storing computed values to SMEM that will later be consumed by WGMMA (e.g., writing an intermediate P matrix in Flash Attention), you need to apply the same swizzle the TMA descriptor would apply. Use `smem.apply_swizzle`:
+
+```python
+from pyptx.smem import apply_swizzle
+
+# Logical byte offset for element P[m][k]:
+logical = reg.scalar(u32)
+ptx.inst.mad.lo.u32(logical, row, K * 2, col_byte)
+
+# Apply B32 swizzle (for bf16 with K=16, row_bytes=32)
+physical = apply_swizzle(logical, "32B")
+
+addr = smem_base + physical
+ptx.inst.st.shared.b16(ptx.addr(addr), value)
+```
+
+`apply_swizzle` emits three instructions (`and.b32`, `shr.u32`, `xor.b32`) for non-trivial modes, and is a no-op for `None` / `"NONE"`.
+
+## What To Read Next
+
+<CardGroup cols={2}>
+  <Card title="Tiles, Layouts, and TMA" href="/guides/tiles-layouts-tma">
+    How Tile specs, Layout values, and TMA descriptors connect to smem.wgmma_tile.
+  </Card>
+  <Card title="Mbarriers and Async Sync" href="/guides/mbarriers">
+    Using smem.mbarrier with ptx.mbarrier.* for TMA and WGMMA synchronization.
+  </Card>
+  <Card title="RMS Norm Walkthrough" href="/guides/rms-norm">
+    See reg.scalar, reg.array, and smem.alloc in a complete real kernel.
+  </Card>
+  <Card title="Hopper GEMM" href="/guides/handwritten-gemm">
+    How smem.wgmma_tile and reg.array(f32, 32) power a 815 TFLOPS kernel.
+  </Card>
+</CardGroup>

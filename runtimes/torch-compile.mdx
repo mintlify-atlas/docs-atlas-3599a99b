@@ -1,0 +1,196 @@
+---
+title: 'Using pyptx Kernels with torch.compile'
+description: 'Integrate pyptx kernels into torch.compile graphs using the custom_op path, with shape specialization, fake tensor inference, and CUDA graph replay details.'
+---
+
+pyptx kernels work inside `torch.compile` without any changes to how you write or call them. The `torch.library.custom_op` registration that backs eager dispatch is also what lets Dynamo capture the kernel call into a compiled graph.
+
+## Basic usage
+
+Wrap the call site — not the kernel itself — with `@torch.compile`. The kernel object is defined the same way as in eager mode.
+
+```python
+import torch
+from pyptx import Tile, kernel, ptx, reg
+from pyptx.types import f32, u32
+
+WARP_SIZE = 32
+
+
+def build_rms_norm(B: int, N: int, eps: float = 1e-6):
+    items_per_thread = N // WARP_SIZE
+
+    @kernel(
+        in_specs=(Tile(B, N, f32), Tile(N, f32)),
+        out_specs=(Tile(B, N, f32),),
+        grid=(B, 1, 1),
+        block=(WARP_SIZE, 1, 1),
+        arch="sm_90a",
+    )
+    def rms_norm(X, W, Y):
+        px, pw, py = ptx.global_ptrs(X, W, Y)
+
+        row = reg.from_(ptx.special.ctaid.x(), u32)
+        row_byte_off = row * (N * 4)
+        px += row_byte_off
+        py += row_byte_off
+
+        tid = reg.from_(ptx.special.tid.x(), u32)
+        sum_sq = reg.scalar(f32, init=0.0)
+        x_vals = reg.array(f32, items_per_thread)
+
+        for i in range(items_per_thread):
+            idx = tid + i * WARP_SIZE
+            ptr = px + idx * 4
+            ptx.inst.ld.global_.f32(x_vals[i], ptx.addr(ptr))
+            ptx.inst.fma.rn.f32(sum_sq, x_vals[i], x_vals[i], sum_sq)
+
+        ptx.warp.reduce_sum(sum_sq)
+
+        mean_sq = reg.scalar(f32)
+        inv_n = reg.scalar(f32, init=1.0 / N)
+        eps_reg = reg.scalar(f32, init=eps)
+        rstd = reg.scalar(f32)
+        ptx.inst.mul.f32(mean_sq, sum_sq, inv_n)
+        ptx.inst.add.f32(mean_sq, mean_sq, eps_reg)
+        ptx.inst.rsqrt.approx.f32(rstd, mean_sq)
+
+        for i in range(items_per_thread):
+            idx = tid + i * WARP_SIZE
+            off = idx * 4
+            w_val = reg.scalar(f32)
+            y_val = reg.scalar(f32)
+            ptx.inst.ld.global_.f32(w_val, ptx.addr(pw + off))
+            ptx.inst.mul.f32(y_val, x_vals[i], rstd)
+            ptx.inst.mul.f32(y_val, y_val, w_val)
+            ptx.inst.st.global_.f32(ptx.addr(py + off), y_val)
+        ptx.ret()
+
+    return rms_norm
+
+
+k = build_rms_norm(4, 64)
+
+
+@torch.compile
+def fn(x, w):
+    return k(x, w)
+
+
+x = torch.randn(4, 64, device="cuda") * 0.3
+w = torch.randn(64, device="cuda") * 0.1 + 1.0
+out = fn(x, w)
+```
+
+The first call to `fn` triggers Dynamo tracing and then compiles an optimized graph. Subsequent calls with the same input shapes execute the compiled graph directly.
+
+## How graph capture works
+
+When Dynamo traces `fn`, it encounters the `k(x, w)` call. Because pyptx registers each kernel under a `torch.library.custom_op` name (`pyptx::kernel_<handle>`), Dynamo treats it as an opaque custom op rather than graph-breaking on it.
+
+During tracing, the **fake/meta implementation** of the custom op runs. This implementation creates empty tensors with the correct shapes and dtypes without touching the GPU:
+
+```python
+@pyptx_op.register_fake
+def fake(inputs):
+    device = inputs[0].device if inputs else torch.device("cuda")
+    outs = []
+    for spec in out_specs:
+        concrete_shape = spec.resolve_shape(out_shape_env)
+        torch_dtype = _ptx_type_to_torch_dtype(spec.dtype)
+        outs.append(torch.empty(concrete_shape, dtype=torch_dtype, device=device))
+    return outs
+```
+
+This is what allows Dynamo to:
+
+- keep the kernel call in the graph instead of graph-breaking on it
+- infer output shapes for downstream operations
+- avoid executing the real CUDA launch during tracing
+
+At runtime, the real implementation calls `call_kernel_via_torch` which allocates actual output tensors and calls the C++ shim.
+
+## The custom_op path in detail
+
+Each `(kernel, cubin_handle)` pair maps to exactly one registered op. The registration in `torch_support.get_or_register_torch_op` is cached in `_REGISTERED_OPS` so subsequent calls reuse the same op object. The op schema is:
+
+```python
+@torch.library.custom_op(
+    "pyptx::kernel_<handle>",
+    mutates_args=(),
+    schema="(Tensor[] inputs) -> Tensor[]",
+)
+def pyptx_op(inputs): ...
+```
+
+The explicit schema string is required because PyTorch's schema inference does not handle lowercase `list[torch.Tensor]` annotations.
+
+## Launch overhead in compiled mode
+
+<AccordionGroup>
+  <Accordion title="First call (tracing + compilation)">
+    The first call to a `@torch.compile`-wrapped function triggers Dynamo tracing followed by Inductor compilation. During tracing, pyptx also compiles the PTX and registers the cubin handle. Total overhead for the first call is typically several hundred milliseconds, dominated by Dynamo and Inductor.
+  </Accordion>
+  <Accordion title="Subsequent calls — ~14–22 µs">
+    Once compiled, the graph dispatcher calls `pyptx_op` directly. With the C++ extension available (ninja installed), this path costs ~14 µs. Without the extension it falls back to ctypes at ~22 µs. These figures include the custom op dispatch overhead on top of the raw shim launch.
+  </Accordion>
+  <Accordion title="CUDA graph replay — ~4 µs">
+    For repeated calls with the same input shapes, capturing the compiled function into a CUDA graph gives near-zero CPU overhead.
+  </Accordion>
+</AccordionGroup>
+
+## CUDA graph replay
+
+CUDA graphs work the same way with compiled and eager pyptx kernels. Capture after the first (warm-up) call:
+
+```python
+k = build_rms_norm(256, 4096)
+x = torch.randn(256, 4096, device="cuda")
+w = torch.randn(4096, device="cuda")
+
+# Warm up: compiles PTX and registers the kernel handle
+k(x, w)
+
+g = torch.cuda.CUDAGraph()
+s = torch.cuda.Stream()
+s.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(s):
+    k(x, w)
+torch.cuda.current_stream().wait_stream(s)
+with torch.cuda.graph(g, stream=s):
+    out = k(x, w)
+
+g.replay()  # ~4 µs per replay
+```
+
+<Tip>
+  CUDA graph capture can also be applied to a `@torch.compile`-wrapped function. Compile first, warm up, then capture. The replay path will skip both the Dynamo graph dispatcher and the Python custom op layer.
+</Tip>
+
+## Shape specialization and retracing
+
+pyptx kernels are shape-specialized at authoring time through `Tile` specs with concrete integer dimensions. `torch.compile` performs its own shape specialization on top of this.
+
+If you call `fn` with inputs of a different shape than the first traced call, Dynamo retraces the function. Each new shape set triggers:
+
+1. A new Dynamo trace (compiles a new graph variant).
+2. A new pyptx PTX trace (because the `Tile` concrete dimensions change only if you rebuild the kernel for the new shape).
+
+<Warning>
+  If you build one kernel for shape `(4, 64)` and call it with shape `(8, 64)`, the pyptx kernel will fail at shape validation — not at Dynamo retracing. Build separate kernel objects for each concrete shape, or use symbolic `Tile` dimensions.
+</Warning>
+
+## Current scope
+
+**What works:**
+
+- Tracing through `torch.compile` with no graph breaks on pyptx kernel calls
+- Opaque custom-op execution in the compiled graph
+- Shape inference via the fake/meta implementation
+- CUDA graph capture and replay
+
+**Follow-up work:**
+
+- Deeper compiler integration beyond opaque custom ops (e.g., Inductor fusion across kernel boundaries)
+
+The current behavior is covered by the `TestTorchCompile` test cases in `tests/test_torch_dispatch.py`.

@@ -1,0 +1,204 @@
+---
+title: "types — PTX scalar type singletons"
+description: "Reference for pyptx.types: all PTX scalar type objects including float, integer, bit, and predicate types, plus the PtxType class and from_name lookup."
+---
+
+The `types` module exposes singleton `PtxType` instances for every PTX scalar type. These objects are the currency passed to `reg.scalar`, `reg.array`, `smem.alloc`, and `Tile`. They are intentionally lightweight — each carries only a name string and a bit width.
+
+```python
+from pyptx.types import bf16, f32, u32, pred
+
+acc = reg.array(f32, 64)
+sA  = smem.alloc(bf16, (3, 64, 64))
+tid = reg.from_(ptx.special.tid.x(), u32)
+p   = reg.scalar(pred)
+```
+
+---
+
+## `PtxType` class
+
+All type singletons are instances of `PtxType`.
+
+<ResponseField name="name" type="str">
+  Type name without the leading dot: `"f32"`, `"bf16"`, `"u64"`, `"pred"`, etc.
+</ResponseField>
+
+<ResponseField name="bits" type="int">
+  Width in bits: `8`, `16`, `32`, `64`, `128`, or `1` for `pred`.
+</ResponseField>
+
+<ResponseField name="ptx" type="str">
+  PTX text form with a leading dot: `".f32"`, `".bf16"`, `".u64"`, `".pred"`.
+</ResponseField>
+
+---
+
+## Floating-point types
+
+| Singleton | PTX spelling | Bits | Notes |
+|---|---|---|---|
+| `f16` | `.f16` | 16 | IEEE 754 half-precision |
+| `f16x2` | `.f16x2` | 32 | Packed two f16 values |
+| `bf16` | `.bf16` | 16 | Brain float (Google/NVIDIA) |
+| `bf16x2` | `.bf16x2` | 32 | Packed two bf16 values |
+| `tf32` | `.tf32` | 32 | TensorFloat-32 (tensor core inputs) |
+| `f32` | `.f32` | 32 | IEEE 754 single-precision |
+| `f64` | `.f64` | 64 | IEEE 754 double-precision |
+| `e4m3` | `.e4m3` | 8 | FP8 E4M3 (Hopper/Blackwell) |
+| `e5m2` | `.e5m2` | 8 | FP8 E5M2 (Hopper/Blackwell) |
+
+```python
+from pyptx.types import f16, f16x2, bf16, bf16x2, tf32, f32, f64, e4m3, e5m2
+```
+
+---
+
+## Unsigned integer types
+
+| Singleton | PTX spelling | Bits |
+|---|---|---|
+| `u8` | `.u8` | 8 |
+| `u16` | `.u16` | 16 |
+| `u32` | `.u32` | 32 |
+| `u64` | `.u64` | 64 |
+
+```python
+from pyptx.types import u8, u16, u32, u64
+
+tid = reg.from_(ptx.special.tid.x(), u32)
+ptr = reg.scalar(u64)
+```
+
+---
+
+## Signed integer types
+
+| Singleton | PTX spelling | Bits |
+|---|---|---|
+| `s8` | `.s8` | 8 |
+| `s16` | `.s16` | 16 |
+| `s32` | `.s32` | 32 |
+| `s64` | `.s64` | 64 |
+
+```python
+from pyptx.types import s32
+
+loop_var = reg.scalar(s32, init=0)
+```
+
+---
+
+## Bit types
+
+Untyped bit-pattern registers. Used for raw data movement, pointer storage, and operations that are not semantically integer or float.
+
+| Singleton | PTX spelling | Bits | Common use |
+|---|---|---|---|
+| `b8` | `.b8` | 8 | Byte-level ops |
+| `b16` | `.b16` | 16 | Half-word moves |
+| `b32` | `.b32` | 32 | General-purpose, shfl source |
+| `b64` | `.b64` | 64 | Pointers, mbarrier state |
+| `b128` | `.b128` | 128 | Quad-word loads/stores |
+
+```python
+from pyptx.types import b32, b64
+
+state = reg.scalar(b64)    # mbarrier state register
+tmp   = reg.scalar(b32)    # shfl.sync.bfly source
+ptr   = reg.scalar(b64)    # global pointer
+```
+
+---
+
+## Predicate type
+
+| Singleton | PTX spelling | Bits |
+|---|---|---|
+| `pred` | `.pred` | 1 |
+
+Predicate registers gate instruction execution with `@p` / `@!p`. Allocate via `reg.scalar(pred)` or use comparison operators on integer `Reg` objects which emit `setp` and return pred registers automatically.
+
+```python
+from pyptx.types import pred
+
+p = reg.scalar(pred)
+q = (tid < 128)      # setp.lt.u32 — returns a pred Reg
+```
+
+---
+
+## `from_name(name) → PtxType`
+
+Look up a type singleton by name. Accepts names with or without a leading dot.
+
+```python
+from pyptx.types import from_name
+
+t = from_name("f32")    # → f32
+t = from_name(".bf16")  # → bf16
+```
+
+---
+
+## Usage patterns
+
+<AccordionGroup>
+  <Accordion title="Passing types to reg and smem">
+
+```python
+from pyptx import reg, smem
+from pyptx.types import bf16, f32, u32, u64, pred
+
+# Registers
+loop_var = reg.scalar(u32, init=0)
+ptr      = reg.scalar(u64)
+acc      = reg.array(f32, 64)
+p        = reg.scalar(pred)
+
+# Shared memory
+sA = smem.alloc(bf16, (3, 64, 64), swizzle="128B")
+```
+
+  </Accordion>
+  <Accordion title="Passing types to Tile">
+
+```python
+from pyptx import Tile, Layout
+from pyptx.types import bf16, f32
+
+in_a  = Tile("M", "K", bf16, Layout.ROW)
+in_b  = Tile("K", "N", bf16, Layout.COL)
+out_c = Tile("M", "N", f32,  Layout.ROW)
+```
+
+  </Accordion>
+  <Accordion title="Inspecting type metadata">
+
+```python
+from pyptx.types import f32, bf16, u32
+
+print(f32.name)   # "f32"
+print(f32.ptx)    # ".f32"
+print(f32.bits)   # 32
+
+print(bf16.bits)  # 16
+print(u32.bits)   # 32
+```
+
+  </Accordion>
+  <Accordion title="Float init encoding (f32/f64 only)">
+
+```python
+from pyptx.types import f32, f64
+
+# reg.scalar with a float init encodes it as PTX hex
+zero = reg.scalar(f32, init=0.0)   # mov.f32 %f0, 0f00000000;
+one  = reg.scalar(f64, init=1.0)   # mov.f64 %fd0, 0d3FF0000000000000;
+
+# f16 / bf16 don't support direct float literals —
+# use b16 + mov to transfer a bit pattern instead
+```
+
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,518 @@
+---
+title: "JAX Runtime Support — pyptx.jax_support"
+description: "API reference for pyptx.jax_support: FFI registration, PTX compilation, TMA descriptor synthesis, and kernel launch via jax.ffi.ffi_call on XLA's CUDA stream."
+---
+
+The `pyptx.jax_support` module is the bridge between a pyptx kernel traced to PTX and an actual `@jax.jit` call site. It owns the full JAX/XLA execution path: resolving shapes, compiling PTX to a driver-loadable handle, registering launch metadata with the C++ shim, and building the `jax.ffi.ffi_call` that fires on XLA's CUDA stream.
+
+The C++ shim (`libpyptx_shim.so`) is intentionally thin. Most runtime logic lives here in Python — PTX compilation, launch metadata registration, TMA descriptor synthesis, and process-local kernel handle bookkeeping. On machines without a full CUDA/JAX stack the tracing and lowering steps still work, enabling codegen and inspection workflows without a live GPU.
+
+---
+
+## Kernel handle registry
+
+Each compiled kernel is assigned a process-local integer handle. The handle is the only attribute passed through the XLA FFI boundary; all launch parameters (grid, block, smem, TMA specs) live in the shim's registry under that handle.
+
+### `CubinRecord`
+
+A compiled kernel together with its launch configuration.
+
+```python
+@dataclass
+class CubinRecord:
+    handle: int
+    ptx_source: str
+    kernel_name: str
+    smem_bytes: int = 0
+    grid: tuple[int, int, int] = (1, 1, 1)
+    block: tuple[int, int, int] = (1, 1, 1)
+    cu_function: Optional[int] = None   # CUfunction as intptr_t
+    module: Any = None                  # CUmodule (kept alive)
+    cubin_bytes: Optional[bytes] = None
+```
+
+`cu_function` is `None` on laptop builds where `cuda-python` is not installed or the driver is unavailable. `module` is kept alive so the function pointer remains valid for the lifetime of the kernel.
+
+<ResponseField name="handle" type="int" required>
+  Process-local integer identifier for this record.
+</ResponseField>
+
+<ResponseField name="ptx_source" type="str" required>
+  The PTX source text used to produce this kernel.
+</ResponseField>
+
+<ResponseField name="kernel_name" type="str" required>
+  The PTX entry symbol (e.g. `"vector_add"`).
+</ResponseField>
+
+<ResponseField name="smem_bytes" type="int">
+  Dynamic shared memory in bytes requested at launch. Default `0`.
+</ResponseField>
+
+<ResponseField name="grid" type="tuple[int, int, int]">
+  Launch grid dimensions `(x, y, z)`. Default `(1, 1, 1)`.
+</ResponseField>
+
+<ResponseField name="block" type="tuple[int, int, int]">
+  Thread-block dimensions `(x, y, z)`. Default `(1, 1, 1)`.
+</ResponseField>
+
+<ResponseField name="cu_function" type="Optional[int]">
+  Raw `CUfunction` pointer cast to `int`. `None` when the CUDA driver is unavailable.
+</ResponseField>
+
+<ResponseField name="module" type="Any">
+  The `CUmodule` object. Kept alive so `cu_function` stays valid.
+</ResponseField>
+
+---
+
+### `CubinRegistry`
+
+Thread-safe process-local table mapping integer handle → `CubinRecord`.
+
+```python
+registry = get_cubin_registry()
+handle = registry.register(ptx_source, kernel_name, smem_bytes=4096, grid=(8,1,1), block=(128,1,1))
+record  = registry.get(handle)
+registry.clear()
+```
+
+#### `register`
+
+<ParamField path="ptx_source" type="str" required>
+  The PTX source text for the kernel.
+</ParamField>
+
+<ParamField path="kernel_name" type="str" required>
+  The PTX entry symbol name.
+</ParamField>
+
+<ParamField path="cubin_bytes" type="Optional[bytes]">
+  Pre-compiled cubin bytes. Unused by the shim path; kept for legacy compatibility.
+</ParamField>
+
+<ParamField path="smem_bytes" type="int">
+  Dynamic shared memory requirement in bytes.
+</ParamField>
+
+<ParamField path="grid" type="tuple[int, int, int]">
+  Launch grid `(x, y, z)`.
+</ParamField>
+
+<ParamField path="block" type="tuple[int, int, int]">
+  Thread-block size `(x, y, z)`.
+</ParamField>
+
+<ParamField path="cu_function" type="Optional[int]">
+  Pre-compiled `CUfunction` pointer, or `None`.
+</ParamField>
+
+<ParamField path="module" type="Any">
+  The owning `CUmodule`, or `None`.
+</ParamField>
+
+<ResponseField name="returns" type="int">
+  The newly assigned process-local handle.
+</ResponseField>
+
+#### `get`
+
+<ParamField path="handle" type="int" required>
+  The process-local handle to look up.
+</ParamField>
+
+<ResponseField name="returns" type="Optional[CubinRecord]">
+  The `CubinRecord` for that handle, or `None` if not found.
+</ResponseField>
+
+#### `clear`
+
+Drops all registered kernel records and resets the handle counter to `1`.
+
+---
+
+### `get_cubin_registry`
+
+```python
+def get_cubin_registry() -> CubinRegistry
+```
+
+Returns the process-wide `CubinRegistry` singleton, creating it on first call.
+
+---
+
+## Shim availability
+
+The C++ launch shim (`libpyptx_shim.so`) is loaded lazily on first use. These helpers let you probe its status without triggering an exception.
+
+### `shim_is_available`
+
+```python
+def shim_is_available() -> bool
+```
+
+Returns `True` if the shim loaded successfully and is ready to accept registrations and launches.
+
+### `shim_load_error`
+
+```python
+def shim_load_error() -> Optional[str]
+```
+
+Returns the human-readable reason the shim failed to load, or `None` if it loaded without error. Useful for surfacing diagnostics in error messages.
+
+---
+
+## PTX compilation
+
+### `compile_ptx_to_cubin`
+
+```python
+def compile_ptx_to_cubin(
+    ptx_source: str,
+    arch: str,
+    kernel_name: str = "",
+    dynamic_smem_bytes: int = 0,
+) -> Optional[tuple[int, Any]]
+```
+
+Driver-JIT compiles a PTX string into an executable `CUfunction`.
+
+<ParamField path="ptx_source" type="str" required>
+  Raw PTX assembly text.
+</ParamField>
+
+<ParamField path="arch" type="str" required>
+  Target architecture string, e.g. `"sm_90a"`.
+</ParamField>
+
+<ParamField path="kernel_name" type="str">
+  The PTX entry symbol. When empty, the name is extracted from the `.visible .entry NAME(` line.
+</ParamField>
+
+<ParamField path="dynamic_smem_bytes" type="int">
+  If nonzero, calls `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES, ...)` so the driver allows more than 48 KB of dynamic shared memory.
+</ParamField>
+
+<ResponseField name="returns" type="Optional[tuple[int, Any]]">
+  `(cu_function_ptr, cu_module)` on success, or `None` on machines without `cuda-python` or a CUDA driver. The module must be kept alive to prevent the function pointer from being invalidated.
+</ResponseField>
+
+If the driver PTX JIT fails with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`, the function falls back to an offline `ptxas` compilation before loading the resulting cubin.
+
+---
+
+## Launch configuration
+
+### `register_launch_config`
+
+```python
+def register_launch_config(
+    handle: int,
+    cu_function: int,
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+    cluster: tuple[int, int, int] = (1, 1, 1),
+    smem_bytes: int = 0,
+) -> None
+```
+
+Registers a compiled kernel in the shim's launch registry. Called once per handle, immediately after compilation. The shim's FFI handler reads this entry at every subsequent kernel launch.
+
+<ParamField path="handle" type="int" required>
+  The process-local handle from `CubinRegistry.register`.
+</ParamField>
+
+<ParamField path="cu_function" type="int" required>
+  The `CUfunction` pointer cast to `int`.
+</ParamField>
+
+<ParamField path="grid" type="tuple[int, int, int]" required>
+  Launch grid `(x, y, z)`.
+</ParamField>
+
+<ParamField path="block" type="tuple[int, int, int]" required>
+  Thread-block size `(x, y, z)`.
+</ParamField>
+
+<ParamField path="cluster" type="tuple[int, int, int]">
+  Thread-block cluster dimensions for Hopper cluster launches. Default `(1, 1, 1)`.
+</ParamField>
+
+<ParamField path="smem_bytes" type="int">
+  Dynamic shared memory in bytes. Default `0`.
+</ParamField>
+
+### `add_scalar_param_to_shim`
+
+```python
+def add_scalar_param_to_shim(
+    handle: int,
+    *,
+    value_bits: int,
+    size_bytes: int,
+) -> None
+```
+
+Registers a scalar raw `.param` value with the shim's launch config for a given handle. Requires a shim built with `pyptx_shim_add_scalar_param` exported (rebuild via `pyptx/_shim/build.sh` if you get a `RuntimeError`).
+
+<ParamField path="handle" type="int" required>
+  The process-local handle.
+</ParamField>
+
+<ParamField path="value_bits" type="int" required>
+  The raw bit pattern of the scalar value.
+</ParamField>
+
+<ParamField path="size_bytes" type="int" required>
+  Size of the parameter in bytes (e.g. `4` for `u32`, `8` for `u64`).
+</ParamField>
+
+---
+
+## TMA descriptor synthesis
+
+Hopper's `cp.async.bulk.tensor` instructions use 128-byte `CUtensorMap` structs ("TMA descriptors"). pyptx synthesizes these host-side at compile time and patches the data pointer on every launch via the shim.
+
+### `synthesize_tma_descriptor`
+
+```python
+def synthesize_tma_descriptor(
+    shape: tuple[int, ...],
+    dtype,
+    layout,
+    box_shape: tuple[int, ...] | None = None,
+    placeholder_ptr: int = 0,
+) -> tuple[Any, int, int]
+```
+
+Builds a 128-byte `CUtensorMap` for a rank-2 tensor.
+
+<ParamField path="shape" type="tuple[int, int]" required>
+  Global tensor shape `(rows, cols)`. Only rank-2 is supported.
+</ParamField>
+
+<ParamField path="dtype" type="PtxType" required>
+  Element type (`bf16`, `f16`, `f32`, `f64`).
+</ParamField>
+
+<ParamField path="layout" type="specs.Layout" required>
+  TMA swizzle layout: `Layout.TMA_128B`, `Layout.TMA_64B`, or `Layout.TMA_32B`.
+</ParamField>
+
+<ParamField path="box_shape" type="Optional[tuple[int, int]]">
+  Tile shape `(box_rows, box_cols)`. Defaults to a size derived from the swizzle width and element size, clamped to the global tensor dimensions.
+</ParamField>
+
+<ParamField path="placeholder_ptr" type="int">
+  Global address stored in the descriptor at creation time. The shim replaces it with the actual buffer pointer on each launch.
+</ParamField>
+
+<ResponseField name="returns" type="tuple[CUtensorMap, int, int]">
+  `(host_tmap, host_blob_ptr, device_blob_ptr)`.
+  - `host_tmap` — the `cuda-python` `CUtensorMap` object; keep it alive for the lifetime of the kernel.
+  - `host_blob_ptr` — raw pointer to the 128-byte struct inside `host_tmap`, used by `cuTensorMapReplaceAddress`.
+  - `device_blob_ptr` — freshly allocated 128-byte device buffer; the shim uploads the patched descriptor here at each launch.
+</ResponseField>
+
+### `synthesize_tma_descriptor_3d`
+
+```python
+def synthesize_tma_descriptor_3d(
+    height: int,
+    width: int,
+    dtype,
+    box_major: int,
+    box_minor: int,
+    *,
+    swizzle_128b: bool = True,
+    padding: bool = False,
+    placeholder_ptr: int = 0,
+) -> tuple
+```
+
+Builds a 3D `CUtensorMap` by reshaping a `(height, width)` row-major matrix into `(64_elements, height, width/64)`. This lets TMA handle tiles wider than 64 bf16 elements (which exceeds the 128B swizzle line).
+
+<ParamField path="height" type="int" required>
+  Number of rows (M for operand A, N for operand B/C).
+</ParamField>
+
+<ParamField path="width" type="int" required>
+  Number of columns. Must be a multiple of 64.
+</ParamField>
+
+<ParamField path="dtype" type="PtxType" required>
+  Element type (e.g. `bf16`).
+</ParamField>
+
+<ParamField path="box_major" type="int" required>
+  Tile rows to load (BM for A, BN for B).
+</ParamField>
+
+<ParamField path="box_minor" type="int" required>
+  Tile columns to load (BK for A/B, BM for C consumers).
+</ParamField>
+
+<ParamField path="swizzle_128b" type="bool">
+  Use 128B swizzle. `True` for A/B operands, `False` for C. Default `True`.
+</ParamField>
+
+<ParamField path="padding" type="bool">
+  Pad the innermost box dimension to 72 (required for C store paths). Default `False`.
+</ParamField>
+
+<ParamField path="placeholder_ptr" type="int">
+  Global address patched at launch time. Default `0`.
+</ParamField>
+
+<ResponseField name="returns" type="tuple[CUtensorMap, int, int]">
+  Same `(host_tmap, host_blob_ptr, device_blob_ptr)` triple as `synthesize_tma_descriptor`.
+</ResponseField>
+
+### `add_tma_spec_to_shim`
+
+```python
+def add_tma_spec_to_shim(
+    handle: int,
+    xla_arg_index: int,
+    host_blob_ptr: int,
+    device_blob_ptr: int,
+) -> None
+```
+
+Registers a TMA descriptor spec with the shim for a given kernel handle. At each launch the shim calls `cuTensorMapReplaceAddress` to patch the descriptor with the actual input buffer pointer, then uploads it to device memory.
+
+<ParamField path="handle" type="int" required>
+  The process-local kernel handle.
+</ParamField>
+
+<ParamField path="xla_arg_index" type="int" required>
+  Index of the input buffer (in the unified inputs-then-outputs order) whose device pointer is patched into the descriptor.
+</ParamField>
+
+<ParamField path="host_blob_ptr" type="int" required>
+  Raw pointer to the 128-byte host-side descriptor struct.
+</ParamField>
+
+<ParamField path="device_blob_ptr" type="int" required>
+  `CUdeviceptr` (as `int`) of the 128-byte device buffer.
+</ParamField>
+
+---
+
+## FFI registration and kernel dispatch
+
+### `ensure_ffi_registered`
+
+```python
+def ensure_ffi_registered() -> bool
+```
+
+Registers the `pyptx_launch` FFI target with JAX, if not already done. Wraps the shim's `PyptxLaunch` symbol in a `PyCapsule` via `jax.ffi.pycapsule` and registers it for the `"CUDA"` platform with typed FFI (`api_version=1`).
+
+Returns `True` on success. Returns `False` (without raising) on machines without the shim or without JAX — tracing and lowering tests can still run because `jit().lower()` is pure tracing and never fires the handler.
+
+### `call_kernel_via_ffi`
+
+```python
+def call_kernel_via_ffi(
+    *inputs,
+    cubin_handle: int,
+    out_specs: Sequence[Tile],
+    out_shape_env: dict[str, int],
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+    cluster: tuple[int, int, int] = (1, 1, 1),
+    smem_bytes: int = 0,
+) -> Any
+```
+
+Builds and invokes a `jax.ffi.ffi_call` for one kernel invocation. The only attribute forwarded to the C++ handler is `cubin_handle` — grid, block, smem, and TMA specs are already stored in the shim registry.
+
+<ParamField path="inputs" type="jax.Array..." required>
+  Input JAX arrays forwarded verbatim to the FFI call.
+</ParamField>
+
+<ParamField path="cubin_handle" type="int" required>
+  The process-local handle returned by `CubinRegistry.register`.
+</ParamField>
+
+<ParamField path="out_specs" type="Sequence[Tile]" required>
+  Output tensor specifications from the `@kernel` decorator. Used to build `ShapeDtypeStruct` descriptors for `ffi_call`.
+</ParamField>
+
+<ParamField path="out_shape_env" type="dict[str, int]" required>
+  Mapping of symbolic dimension names to their concrete integer values, used to resolve any shape expressions in `out_specs`.
+</ParamField>
+
+<ParamField path="grid" type="tuple[int, int, int]" required>
+  Launch grid `(x, y, z)`.
+</ParamField>
+
+<ParamField path="block" type="tuple[int, int, int]" required>
+  Thread-block size `(x, y, z)`.
+</ParamField>
+
+<ParamField path="cluster" type="tuple[int, int, int]">
+  Cluster dimensions. Default `(1, 1, 1)`.
+</ParamField>
+
+<ParamField path="smem_bytes" type="int">
+  Dynamic shared memory in bytes. Default `0`.
+</ParamField>
+
+<ResponseField name="returns" type="jax.Array | tuple[jax.Array, ...]">
+  A single JAX array when `out_specs` has one entry, otherwise a tuple.
+</ResponseField>
+
+---
+
+## Example
+
+```python
+import jax
+import jax.numpy as jnp
+from pyptx import kernel
+from pyptx.specs import Tile
+from pyptx.jax_support import (
+    compile_ptx_to_cubin,
+    get_cubin_registry,
+    register_launch_config,
+    ensure_ffi_registered,
+    call_kernel_via_ffi,
+    shim_is_available,
+)
+
+# 1. Compile PTX → CUfunction
+ptx = open("vector_add.ptx").read()
+cu_fn, cu_mod = compile_ptx_to_cubin(ptx, arch="sm_90a", kernel_name="vector_add")
+
+# 2. Register in the process-local table
+registry = get_cubin_registry()
+handle = registry.register(
+    ptx, "vector_add",
+    cu_function=cu_fn, module=cu_mod,
+    grid=(32, 1, 1), block=(128, 1, 1),
+)
+
+# 3. Push config into the shim
+register_launch_config(handle, cu_fn, grid=(32,1,1), block=(128,1,1))
+ensure_ffi_registered()
+
+# 4. Call from inside @jax.jit
+@jax.jit
+def run(a, b):
+    return call_kernel_via_ffi(
+        a, b,
+        cubin_handle=handle,
+        out_specs=[Tile(dtype="f32", shape=(4096,))],
+        out_shape_env={},
+        grid=(32, 1, 1),
+        block=(128, 1, 1),
+    )
+
+a = jnp.ones(4096)
+b = jnp.ones(4096)
+c = run(a, b)
+```

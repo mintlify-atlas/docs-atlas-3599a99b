@@ -1,0 +1,109 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "pyptx",
+  "projectDescription": "A Python DSL for writing handcrafted PTX kernels targeting NVIDIA Hopper and Blackwell GPUs, callable from JAX and PyTorch.",
+  "theme": "luma",
+  "primaryColor": "#093bc5",
+  "lightColor": "#071c36",
+  "darkColor": "#5b73e8",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/first-kernel",
+              "guides/registers-and-smem",
+              "guides/tiles-layouts-tma",
+              "guides/mbarriers",
+              "guides/rms-norm",
+              "guides/handwritten-gemm",
+              "guides/blackwell-gemm",
+              "guides/debugging"
+            ]
+          },
+          {
+            "group": "Runtimes",
+            "pages": [
+              "runtimes/jax",
+              "runtimes/torch",
+              "runtimes/torch-compile"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/how-it-works",
+              "concepts/transpiler",
+              "concepts/performance",
+              "concepts/comparison"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core",
+            "pages": [
+              "api/kernel",
+              "api/ptx",
+              "api/reg",
+              "api/smem",
+              "api/types",
+              "api/specs"
+            ]
+          },
+          {
+            "group": "Runtimes",
+            "pages": [
+              "api/jax-support",
+              "api/torch-support",
+              "api/cache"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "api/wgmma-layout",
+              "api/codegen"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "One Python call = one PTX instruction — no hidden optimizer between your code and the PTX",
+    "Full Hopper ISA support: WGMMA, TMA 2D/3D multicast, mbarriers, cluster launch",
+    "Full Blackwell ISA support: tcgen05.mma, TMEM, SMEM descriptors, 2-SM cooperative MMA",
+    "PTX parser + emitter with byte-identical round-trip on 218+ real-world PTX files",
+    "PTX-to-Python transpiler to convert nvcc/Triton/Pallas output to editable pyptx DSL",
+    "Single kernel callable from JAX (jax.jit), PyTorch eager, and torch.compile",
+    "C++ dispatch shim for low-overhead kernel launches (~14 µs with ninja)",
+    "PyTorch autograd support via differentiable_kernel"
+  ],
+  "publicApiSurface": [
+    "pyptx.kernel — @kernel decorator for tracing Python functions into PTX",
+    "pyptx.ptx — PTX instruction namespace (ptx.inst.*, ptx.wgmma.*, ptx.tcgen05.*, ptx.cp.async.*, ptx.mbarrier.*, etc.)",
+    "pyptx.reg — register allocation (reg.scalar, reg.array, reg.from_, reg.pred)",
+    "pyptx.smem — shared memory allocation (smem.wgmma_tile, smem.mbarrier, smem.alloc)",
+    "pyptx.Tile / pyptx.Layout — tensor boundary spec for @kernel in_specs/out_specs",
+    "pyptx.intrinsic — @intrinsic decorator for multi-instruction composable building blocks",
+    "pyptx.differentiable_kernel — wrap forward+backward kernels for torch.autograd",
+    "pyptx.types — PTX type objects: bf16, f32, f16, u32, s32, b32, b64, etc.",
+    "pyptx.codegen.ptx_to_python — PTX → Python transpiler function",
+    "python -m pyptx.codegen — CLI transpiler entrypoint"
+  ]
+}

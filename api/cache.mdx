@@ -1,0 +1,243 @@
+---
+title: "Kernel Compilation Cache — pyptx.cache"
+description: "API reference for pyptx.cache: disk-backed PTX and cubin caching keyed by function identity, template parameters, input shapes, and target architecture."
+---
+
+The `pyptx.cache` module provides a two-level (memory + disk) cache for compiled PTX and cubin artifacts. Caching prevents redundant recompilation across Python process restarts and across multiple calls with the same specialization. The cache key captures the full kernel identity: function name, template parameter values, input shapes and dtypes, and target architecture.
+
+Each specialization is stored under `~/.cache/pyptx/` (or the path in `$PYPTX_CACHE_DIR`) with three files: a `.ptx` source, an optional `.cubin` binary, and a `.json` metadata sidecar. The PTX file is always written so users can inspect generated assembly without access to the original Python source.
+
+---
+
+## Configuration
+
+### `DEFAULT_CACHE_DIR`
+
+The default cache directory as a `pathlib.Path`. Resolved at import time from the environment:
+
+```python
+DEFAULT_CACHE_DIR = Path(os.environ["PYPTX_CACHE_DIR"])   # if set
+DEFAULT_CACHE_DIR = Path.home() / ".cache" / "pyptx"      # otherwise
+```
+
+Set `PYPTX_CACHE_DIR` to a custom path before importing pyptx to redirect all disk cache I/O.
+
+---
+
+## Cache key
+
+### `CacheKey`
+
+```python
+@dataclass(frozen=True)
+class CacheKey:
+    fn_id: str
+    template_kwargs: tuple[tuple[str, Any], ...]
+    input_shapes: tuple[tuple[tuple[int, ...], str], ...]
+    arch: str
+```
+
+Identifies a unique kernel specialization. Instances are frozen dataclasses and may be used as dictionary keys.
+
+<ResponseField name="fn_id" type="str">
+  A stable string identifier for the kernel function, typically `fn.__qualname__`.
+</ResponseField>
+
+<ResponseField name="template_kwargs" type="tuple[tuple[str, Any], ...]">
+  Sorted tuple of `(name, value)` pairs for every template parameter used in this specialization.
+</ResponseField>
+
+<ResponseField name="input_shapes" type="tuple[tuple[tuple[int, ...], str], ...]">
+  One entry per input: `(shape_tuple, dtype_name)`. For example, `((1024, 512), "bf16")`.
+</ResponseField>
+
+<ResponseField name="arch" type="str">
+  Target architecture string, e.g. `"sm_90a"`.
+</ResponseField>
+
+#### `CacheKey.hash`
+
+```python
+def hash(self) -> str
+```
+
+Returns a stable, 32-character SHA-256 hex digest of the cache key. The digest is used as the base filename for all three cache files (`<digest>.ptx`, `<digest>.cubin`, `<digest>.json`).
+
+<ResponseField name="returns" type="str">
+  32-hex-character SHA-256 prefix of the JSON-serialized key.
+</ResponseField>
+
+---
+
+## Cache entry
+
+### `CacheEntry`
+
+```python
+@dataclass
+class CacheEntry:
+    key: CacheKey
+    ptx_source: str
+    cubin_bytes: bytes | None
+    metadata: dict[str, Any]
+```
+
+A single cached compilation result.
+
+<ResponseField name="key" type="CacheKey">
+  The key that uniquely identifies this specialization.
+</ResponseField>
+
+<ResponseField name="ptx_source" type="str">
+  The full PTX assembly text. Always populated.
+</ResponseField>
+
+<ResponseField name="cubin_bytes" type="bytes | None">
+  Pre-compiled cubin bytes, or `None` for PTX-only entries (cubin compiled on demand at load time).
+</ResponseField>
+
+<ResponseField name="metadata" type="dict[str, Any]">
+  Arbitrary key/value pairs serialized alongside the entry. Used for grid, block, smem metadata, and other launch parameters.
+</ResponseField>
+
+---
+
+## Cache store
+
+### `CubinCache`
+
+```python
+class CubinCache(
+    cache_dir: Path | None = None,
+    enable_disk: bool = True,
+)
+```
+
+Process-local, thread-safe in-memory cache with optional disk persistence. Checks memory first on `get`, then disk. Writes to both layers on `put`.
+
+<ParamField path="cache_dir" type="Optional[Path]">
+  Override the cache directory. Defaults to `DEFAULT_CACHE_DIR`.
+</ParamField>
+
+<ParamField path="enable_disk" type="bool">
+  Set to `False` to use a memory-only cache (useful in tests or read-only environments). Default `True`.
+</ParamField>
+
+#### `get`
+
+```python
+def get(self, key: CacheKey) -> CacheEntry | None
+```
+
+Looks up a cache entry. Checks the in-memory dictionary first, then the disk. On a disk hit the entry is promoted to memory before being returned.
+
+<ParamField path="key" type="CacheKey" required>
+  The key to look up.
+</ParamField>
+
+<ResponseField name="returns" type="Optional[CacheEntry]">
+  The cached entry, or `None` on a miss.
+</ResponseField>
+
+#### `put`
+
+```python
+def put(self, entry: CacheEntry) -> None
+```
+
+Stores a cache entry in memory and, if `enable_disk=True`, writes `.ptx`, optional `.cubin`, and `.json` files to `cache_dir`. Disk write errors (full filesystem, permission denied) are silently swallowed so a cache failure never aborts compilation.
+
+<ParamField path="entry" type="CacheEntry" required>
+  The entry to store.
+</ParamField>
+
+#### `clear`
+
+```python
+def clear(self, *, disk: bool = False) -> None
+```
+
+Drops the in-memory cache. When `disk=True` also deletes all `.ptx`, `.cubin`, and `.json` files in `cache_dir`.
+
+<ParamField path="disk" type="bool">
+  If `True`, removes persisted files from disk as well. Default `False`.
+</ParamField>
+
+#### `__len__`
+
+Returns the number of entries currently in the in-memory layer.
+
+#### `__contains__`
+
+```python
+key in cache   # True if cache.get(key) is not None
+```
+
+---
+
+## Global cache singleton
+
+### `get_global_cache`
+
+```python
+def get_global_cache() -> CubinCache
+```
+
+Returns the process-wide `CubinCache` singleton, creating it on first call with default settings (disk cache under `DEFAULT_CACHE_DIR`).
+
+### `set_global_cache`
+
+```python
+def set_global_cache(cache: CubinCache) -> None
+```
+
+Replaces the global cache. Primarily used in tests to swap in a memory-only or temporary-directory-backed cache.
+
+<ParamField path="cache" type="CubinCache" required>
+  The new cache instance.
+</ParamField>
+
+---
+
+## Cache invalidation
+
+The cache provides **no automatic invalidation**. Entries persist across process restarts until explicitly cleared. To invalidate:
+
+- **Process restart only**: call `get_global_cache().clear()` (keeps disk files).
+- **Full wipe**: call `get_global_cache().clear(disk=True)` or delete `~/.cache/pyptx/` directly.
+- **Custom directory**: set `PYPTX_CACHE_DIR=/tmp/my-cache` to use an ephemeral location.
+
+---
+
+## Example
+
+```python
+from pyptx.cache import CacheKey, CacheEntry, CubinCache, get_global_cache, set_global_cache
+from pathlib import Path
+
+# Use an in-memory-only cache for a test run
+set_global_cache(CubinCache(enable_disk=False))
+
+cache = get_global_cache()
+key = CacheKey(
+    fn_id="my_module.vector_add",
+    template_kwargs=(("block_size", 128),),
+    input_shapes=(((4096,), "f32"), ((4096,), "f32")),
+    arch="sm_90a",
+)
+
+# Check for a cached entry
+entry = cache.get(key)
+if entry is None:
+    ptx = compile_kernel(...)        # your PTX compilation step
+    entry = CacheEntry(key=key, ptx_source=ptx, cubin_bytes=None, metadata={})
+    cache.put(entry)
+
+print(entry.ptx_source[:200])
+
+# Wipe everything (memory only)
+cache.clear()
+
+# Wipe memory + disk
+cache.clear(disk=True)
+```

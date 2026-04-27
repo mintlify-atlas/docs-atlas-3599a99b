@@ -1,0 +1,251 @@
+---
+title: "Mbarriers and Async Synchronization in pyptx"
+description: "How to use smem.mbarrier, ptx.mbarrier.init/arrive/wait, phase toggling, try_wait.parity spin loops, and producer/consumer warp specialization in pyptx kernels."
+---
+
+Every non-trivial pyptx kernel uses mbarriers. The Hopper GEMM has one per K-slice. The Blackwell GEMM has a 4-stage ring of `load` + `consumed` barriers plus one `mma` barrier. The grouped GEMM does a two-phase parity dance inside a runtime loop. If you don't have a mental model for mbarriers, these kernels read as noise. This page gives you that model.
+
+## The One-Sentence Mental Model
+
+> An **mbarrier is a completion object living in shared memory** that tracks pending async work. You `arrive` to declare "I'm done with my share," and you `wait` to block until everyone who was supposed to arrive has arrived.
+
+Everything else — phases, `expect_tx`, `try_wait.parity`, cluster scope — is a refinement of that idea to handle TMA, WGMMA, and tcgen05 specifics.
+
+## The Basic Pattern
+
+Every mbarrier use has four calls:
+
+```python
+# ── Setup (once, by thread 0) ─────────────────────────────────────────
+bar = smem.mbarrier(count=1)
+with ptx.if_(tid == 0):
+    ptx.mbarrier.init(bar[0], 1)
+    ptx.fence.proxy_async_shared_cta()
+
+# ── Hot path (one iteration) ──────────────────────────────────────────
+with ptx.if_(tid == 0):
+    ptx.mbarrier.arrive_expect_tx(bar[0], EXPECTED_BYTES)
+    ptx.cp.async_.bulk.tensor_2d(..., mbar=bar[0])
+ptx.bar.sync(0)                          # CTA-wide lockstep
+ptx.mbarrier.wait(bar[0], phase)         # wait for TMA to finish
+phase ^= 1                               # flip for next iteration
+```
+
+Each call has a specific purpose:
+
+| Call | Purpose |
+|---|---|
+| `mbarrier.init(bar, count)` | Allocate barrier in SMEM, set expected arrival count |
+| `arrive_expect_tx(bar, bytes)` | Announce `bytes` of async traffic; barrier releases after they land |
+| `cp.async_.bulk.tensor_2d(..., mbar=bar)` | Issue TMA; will signal barrier on completion |
+| `mbarrier.wait(bar, phase)` | Block until barrier flips to this phase |
+| `phase ^= 1` | Reuse the barrier next iteration |
+
+## Why arrive_expect_tx Exists
+
+A normal `arrive` is immediate — it marks one participant as done right away. But TMA doesn't finish immediately: it kicks off a DRAM → SMEM copy that may take hundreds of cycles.
+
+`arrive_expect_tx(bar, N)` tells the barrier: "expect N bytes of async traffic; mark me arrived only after those bytes actually land in SMEM." The TMA engine reports its own completion against the same barrier, so the `wait` is correct.
+
+**Calculating EXPECTED_BYTES:**
+
+```python
+# Single tile:
+BM * BK * sizeof(dtype)         # e.g. 64 * 16 * 2 = 2048
+
+# Two tiles sharing one barrier (A + B):
+BM * BK * sizeof(dtype) + BN * BK * sizeof(dtype)
+```
+
+<Warning>
+Under-counting the `expect_tx` byte count deadlocks the consumer — the barrier never releases. Over-counting means it never fires. Count carefully when multiple TMA loads share one barrier.
+</Warning>
+
+## Phase Toggling
+
+An mbarrier maintains an internal phase bit. Each time it reaches the expected arrival count, the phase flips:
+
+```
+Iteration 0:  barrier.phase = 0 → TMA completes → barrier.phase = 1
+              wait(phase=0) returns once barrier.phase != 0
+
+Iteration 1:  barrier.phase = 1 → TMA completes → barrier.phase = 0
+              wait(phase=1) returns once barrier.phase != 1
+```
+
+Your code tracks its own `phase` register and toggles it each iteration:
+
+```python
+phase = reg.scalar(b32, init=0)
+with ptx.loop("k_loop", pred=keep_going):
+    # ... issue TMA, arrive_expect_tx ...
+    ptx.bar.sync(0)
+    ptx.mbarrier.wait(bar[0], phase)
+    phase ^= 1
+    # ... consume the data ...
+```
+
+<Note>
+`ptx.bar.sync(0)` is the **CTA-wide sync** — all threads reach the same point before anyone calls `mbarrier.wait`. Without it, some threads could rush ahead and try to wait on a barrier that hasn't even issued the TMA yet.
+</Note>
+
+## The Required fence After init
+
+After `mbarrier.init`, you must emit one fence so the async proxy (the TMA engine) sees the initialized barrier:
+
+```python
+with ptx.if_(tid == 0):
+    ptx.mbarrier.init(bar[0], 1)
+    ptx.fence.proxy_async_shared_cta()   # ← required
+```
+
+Without this fence, the TMA engine might read the barrier in its uninitialized state and never signal completion. You only need this fence once after `init` — don't add it to the hot path.
+
+## The try_wait.parity Spin Loop (Blackwell)
+
+The Blackwell GEMM uses a different wait form — an explicit spin loop around `try_wait.parity` rather than `mbarrier.wait`:
+
+```python
+with ptx.scope():
+    ready = reg.scalar(pred)
+    ptx.label(f"lwait_{ki}")
+    ptx.inst.mbarrier.try_wait.parity.shared__cta.b64(
+        ready, ptx.addr(mbar_l), load_phase
+    )
+    ptx.bra(f"ldone_{ki}", pred=ready)
+    ptx.bra(f"lwait_{ki}")
+    ptx.label(f"ldone_{ki}")
+```
+
+Three differences from `mbarrier.wait`:
+
+- **`try_wait.parity` is non-blocking.** It checks the phase bit once and returns a predicate — "ready" or "not yet."
+- **The spin loop is explicit.** The kernel branches back to the label until the barrier flips.
+- **Phase is computed per iteration**, not maintained as a toggled register: `load_phase = (ki // stages) & 1`.
+
+The `with ptx.scope():` block keeps the `ready` register and labels local, so you can expand this pattern inline multiple times per iteration without label collisions.
+
+**Why use this form?** Two reasons:
+
+1. With N stages, the producer runs up to N iterations ahead. Each iteration's expected phase is a function of how many full ring cycles have passed — easier to compute per iteration than to maintain N separate `phase` registers.
+2. It matches the exact PTX that JAX Pallas Blackwell reference kernels emit, enabling bit-identical comparison.
+
+## Producer/Consumer Warp Specialization
+
+<Steps>
+  <Step title="Split the CTA into specialized warps">
+    Blackwell GEMM (and some Hopper kernels) dedicate warps to specific roles:
+
+    - **TMA warp** (warp 0, lane 0): issues `cp.async_.bulk.tensor_2d` for A and B, signals `bar_load` on arrival.
+    - **MMA warp** (warp 1, lane 0): waits on `bar_load`, issues `tcgen05.mma`, signals `bar_consumed` when done.
+    - **All threads**: wait on `bar_mma` after all K-tiles before running the epilogue.
+  </Step>
+
+  <Step title="Allocate per-stage barriers">
+    ```python
+    STAGES = 4
+    bar_load     = smem.mbarrier(STAGES)   # one per ring slot
+    bar_consumed = smem.mbarrier(STAGES)   # one per ring slot
+    bar_mma      = smem.mbarrier(1)        # shared MMA-done barrier
+    ```
+  </Step>
+
+  <Step title="Producer loop">
+    ```python
+    with ptx.if_(is_tma_warp):
+        for ki in range(k_iters):
+            slot = ki % STAGES
+            if ki >= STAGES:
+                # Wait for MMA to free this slot.
+                consumed_phase = ((ki // STAGES) - 1) & 1
+                # ... try_wait.parity spin on bar_consumed[slot] ...
+
+            ptx.mbarrier.arrive_expect_tx(bar_load[slot], A_BYTES + B_BYTES)
+            ptx.cp.async_.bulk.tensor_2d(dst=smem_a, src=A.tma_desc(), ..., mbar=bar_load[slot])
+            ptx.cp.async_.bulk.tensor_2d(dst=smem_b, src=B.tma_desc(), ..., mbar=bar_load[slot])
+    ```
+  </Step>
+
+  <Step title="Consumer loop">
+    ```python
+    with ptx.if_(is_mma_warp):
+        for ki in range(k_iters):
+            slot = ki % STAGES
+            load_phase = (ki // STAGES) & 1
+            # ... try_wait.parity spin on bar_load[slot] with load_phase ...
+
+            # Issue MMA(s) that accumulate into TMEM
+            ptx.tcgen05.mma(tmem_base, desc_a, desc_b, idesc, ...)
+            ptx.mbarrier.arrive(bar_consumed[slot])   # free the slot
+
+        ptx.tcgen05.commit(bar_mma, space="cluster")  # signal MMA done
+    ```
+  </Step>
+
+  <Step title="All threads wait for MMA commit">
+    ```python
+    # Epilogue: all threads wait on bar_mma before reading TMEM
+    # ... try_wait.parity spin on bar_mma, phase=0 ...
+    ```
+  </Step>
+</Steps>
+
+The ring buffer gives you producer/consumer decoupling. With 4 stages, the TMA warp can stay up to 4 K-tiles ahead of MMA, hiding HBM latency on B200.
+
+## ptx.bar.sync(0) vs mbarrier.wait
+
+These two sync primitives are often confused:
+
+| Primitive | What it syncs | State | Cost |
+|---|---|---|---|
+| `ptx.bar.sync(0)` | CTA-wide hardware barrier | None (dedicated HW) | Very cheap |
+| `ptx.mbarrier.wait(bar, phase)` | Async completion event | SMEM (8 bytes) | Depends on async op |
+
+Typical usage in one iteration:
+
+```python
+with ptx.if_(tid == 0):
+    ptx.mbarrier.arrive_expect_tx(bar[0], BYTES)
+    ptx.cp.async_.bulk.tensor_2d(..., mbar=bar[0])
+ptx.bar.sync(0)                       # lockstep: keep all threads together
+ptx.mbarrier.wait(bar[0], phase)      # async wait: TMA bytes have landed
+# ...now safe to read SMEM...
+```
+
+Remove `bar.sync(0)` and some threads may try to wait on a barrier that hasn't been programmed yet by thread 0.
+
+## Cluster-Scoped Barriers (Blackwell)
+
+On Blackwell with `cta_group::2` MMA, one MMA issue covers two CTAs. The `bar_mma` barrier is cluster-scoped — both CTAs can wait on it:
+
+```python
+ptx.tcgen05.commit(bar_mma, space="cluster")
+```
+
+The `space="cluster"` attribute tells the hardware this barrier crosses CTA boundaries. The barrier still lives in one SM's SMEM, but cluster-scoped primitives let both CTAs signal and wait against it. This requires the cluster launch config on the decorator.
+
+## Checklist Before Shipping a New Kernel
+
+1. **Each barrier initialized exactly once by one thread**, inside `with ptx.if_(tid == 0):`, followed by `ptx.fence.proxy_async_shared_cta()`.
+2. **Every `arrive_expect_tx` has the correct byte count** — sum of all TMA loads against that barrier.
+3. **Every `mbarrier.wait` is followed by `phase ^= 1`** if the barrier is reused next iteration.
+4. **`ptx.bar.sync(0)` before every `mbarrier.wait`** to keep the CTA in lockstep.
+5. **Producer/consumer pairs have both `load` and `consumed` barriers per slot** — don't share, don't double-use.
+6. **If using `cta_group::2`, the commit barrier uses `space="cluster"`.**
+
+## What To Read Next
+
+<CardGroup cols={2}>
+  <Card title="Tiles, Layouts, and TMA" href="/guides/tiles-layouts-tma">
+    What mbar= is attached to and how the TMA descriptor is built.
+  </Card>
+  <Card title="Blackwell GEMM" href="/guides/blackwell-gemm">
+    The most mbarrier-intensive kernel: 4-stage ring buffer, producer/consumer warp specialization, cluster-scoped commit.
+  </Card>
+  <Card title="Hopper GEMM" href="/guides/handwritten-gemm">
+    The simplest mbarrier use: one barrier per K-slice, toggled phase register.
+  </Card>
+  <Card title="Debugging" href="/guides/debugging">
+    How to diagnose deadlocked mbarriers and mismatched arrive counts.
+  </Card>
+</CardGroup>

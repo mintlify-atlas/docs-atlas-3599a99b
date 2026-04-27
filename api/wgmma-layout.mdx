@@ -1,0 +1,272 @@
+---
+title: "WGMMA Layout Helpers — pyptx.wgmma_layout"
+description: "API reference for pyptx.wgmma_layout: canonical GMMA shared-memory layout selection, swizzle helpers (B32/B64/B128), and GmmaLayout for wgmma descriptor construction."
+---
+
+The `pyptx.wgmma_layout` module provides a pure-Python port of the GMMA layout selection logic from CUTLASS's `cute/atom/mma_traits_sm90_gmma.hpp`. Given a tile description (element size, M/N, K, and major axis), it returns the canonical `GmmaLayout` that the `wgmma.mma_async` hardware expects.
+
+Picking the wrong layout causes the wgmma instruction to read permuted k-indices, producing silently incorrect results. The TMA swizzle used to *write* data into shared memory and the swizzle encoded in the wgmma descriptor used to *read* it back must always match — they compose to identity and restore the logical element order.
+
+---
+
+## Enumerations
+
+### `LayoutType`
+
+```python
+class LayoutType(IntEnum):
+    INTERLEAVE = 0  # Swizzle<0,4,3>  — no swizzle, 1 uint128_t wide rows
+    B128       = 1  # Swizzle<3,4,3>  — 8 uint128_t (128-byte) row groups
+    B64        = 2  # Swizzle<2,4,3>  — 4 uint128_t  (64-byte) row groups
+    B32        = 3  # Swizzle<1,4,3>  — 2 uint128_t  (32-byte) row groups
+```
+
+The four canonical GMMA shared-memory layout families, encoding the `layout_type` field in bits `[63:62]` of the 64-bit wgmma descriptor. The integer values match the bit encodings expected by the hardware.
+
+<ResponseField name="INTERLEAVE" type="0">
+  No swizzle. One uint128_t wide row. Corresponds to `CuTe Swizzle<0,4,3>`.
+</ResponseField>
+
+<ResponseField name="B128" type="1">
+  128-byte row groups. Eight uint128_t per row group. Corresponds to `CuTe Swizzle<3,4,3>`. Natural choice for tiles with `row_bytes = 128`.
+</ResponseField>
+
+<ResponseField name="B64" type="2">
+  64-byte row groups. Four uint128_t per row group. Corresponds to `CuTe Swizzle<2,4,3>`. Natural choice for tiles with `row_bytes = 64`.
+</ResponseField>
+
+<ResponseField name="B32" type="3">
+  32-byte row groups. Two uint128_t per row group. Corresponds to `CuTe Swizzle<1,4,3>`. Natural choice for tiles with `row_bytes = 32`.
+</ResponseField>
+
+---
+
+### `Major`
+
+```python
+class Major(IntEnum):
+    K  = 0   # K dimension is fast (row-major A of shape (M, K))
+    MN = 1   # M or N dimension is fast (col-major A / row-major B of shape (K, N))
+```
+
+Selects which operand axis is the "leading" (fastest-varying) dimension in the shared-memory tile.
+
+<ResponseField name="K" type="0">
+  K-major: the K dimension varies fastest. Appropriate for row-major A `(M, K)` and col-major B `(K, N)`.
+</ResponseField>
+
+<ResponseField name="MN" type="1">
+  MN-major: the M or N dimension varies fastest. Appropriate for col-major A `(M, K)` and row-major B `(K, N)`.
+</ResponseField>
+
+---
+
+## Layout descriptor
+
+### `GmmaLayout`
+
+```python
+@dataclass(frozen=True)
+class GmmaLayout:
+    layout_type: LayoutType
+    leading_byte_offset: int
+    stride_byte_offset: int
+    tma_swizzle: str
+    smem_swizzle: str | None
+```
+
+A fully resolved canonical GMMA shared-memory layout. All fields are needed to correctly construct the wgmma descriptor and allocate the matching shared-memory buffer.
+
+<ResponseField name="layout_type" type="LayoutType">
+  The layout family. Encodes into bits `[63:62]` of the wgmma descriptor via `swizzle_code`.
+</ResponseField>
+
+<ResponseField name="leading_byte_offset" type="int">
+  Byte value for `ptx.wgmma.make_descriptor(leading_byte_offset=...)`. Stored in bits `[29:16]` of the descriptor after a 4-bit right-shift (i.e. the hardware expects the value in uint128_t units).
+</ResponseField>
+
+<ResponseField name="stride_byte_offset" type="int">
+  Byte value for `ptx.wgmma.make_descriptor(stride_byte_offset=...)`. Stored in bits `[45:32]` after the same 4-bit shift.
+</ResponseField>
+
+<ResponseField name="tma_swizzle" type="str">
+  The TMA swizzle name to use in the `@kernel` `Tile` spec and `Layout.TMA_*B`. One of `"NONE"`, `"32B"`, `"64B"`, `"128B"`.
+</ResponseField>
+
+<ResponseField name="smem_swizzle" type="str | None">
+  The argument for `smem.alloc(swizzle=...)`. Same values as `tma_swizzle`; `None` when `layout_type` is `INTERLEAVE` (omit the `swizzle=` argument entirely in that case).
+</ResponseField>
+
+#### `GmmaLayout.swizzle_code`
+
+```python
+@property
+def swizzle_code(self) -> int
+```
+
+Integer value of `layout_type` cast to `int`. Pass directly to `ptx.wgmma.make_descriptor(swizzle=layout.swizzle_code)`.
+
+---
+
+## Layout selection
+
+### `pick_gmma_layout`
+
+```python
+def pick_gmma_layout(
+    *,
+    elem_bytes: int,
+    m_or_n: int,
+    k: int,
+    major: Major,
+) -> GmmaLayout
+```
+
+Returns the canonical `GmmaLayout` for an `(elem_bytes, m_or_n, k, major)` tile. This is the core lookup function used internally by `layout_for_a` and `layout_for_b`.
+
+<ParamField path="elem_bytes" type="int" required>
+  Size of one matrix element in bytes. `2` for `bf16`/`f16`, `4` for `tf32`/`f32`.
+</ParamField>
+
+<ParamField path="m_or_n" type="int" required>
+  The M dimension for operand A, or the N dimension for operand B.
+</ParamField>
+
+<ParamField path="k" type="int" required>
+  The K dimension. For `wgmma.mma_async m64nNk16` bf16 kernels, always `16`.
+</ParamField>
+
+<ParamField path="major" type="Major" required>
+  `Major.K` for K-major (row-major A) or `Major.MN` for MN-major (row-major B).
+</ParamField>
+
+<ResponseField name="returns" type="GmmaLayout">
+  A fully populated layout descriptor.
+</ResponseField>
+
+Raises `ValueError` when the tile's row width in bytes is not one of `{16, 32, 64, 128}` for single-stripe layouts, or when M (K-major) or K (MN-major) is not a multiple of 8.
+
+---
+
+### `layout_for_a`
+
+```python
+def layout_for_a(*, dtype: Any, m: int, k: int) -> GmmaLayout
+```
+
+Convenience wrapper: returns the canonical GMMA layout for operand A, assumed to be row-major `(M, K)` in K-major order.
+
+<ParamField path="dtype" type="PtxType" required>
+  Element type. Must expose a `.bits` attribute (e.g. `bf16.bits == 16`).
+</ParamField>
+
+<ParamField path="m" type="int" required>
+  The M dimension of the tile.
+</ParamField>
+
+<ParamField path="k" type="int" required>
+  The K dimension of the tile.
+</ParamField>
+
+<ResponseField name="returns" type="GmmaLayout">
+  Canonical K-major layout for operand A.
+</ResponseField>
+
+```python
+from pyptx.wgmma_layout import layout_for_a
+from pyptx.types import bf16
+
+la = layout_for_a(dtype=bf16, m=64, k=16)
+# la.layout_type          → LayoutType.B32
+# la.leading_byte_offset  → 16
+# la.stride_byte_offset   → 256
+# la.tma_swizzle          → "32B"
+# la.smem_swizzle         → "32B"
+# la.swizzle_code         → 3
+```
+
+---
+
+### `layout_for_b`
+
+```python
+def layout_for_b(*, dtype: Any, k: int, n: int) -> GmmaLayout
+```
+
+Convenience wrapper: returns the canonical GMMA layout for operand B, assumed to be row-major `(K, N)` in MN-major order.
+
+<ParamField path="dtype" type="PtxType" required>
+  Element type with a `.bits` attribute.
+</ParamField>
+
+<ParamField path="k" type="int" required>
+  The K dimension of the tile.
+</ParamField>
+
+<ParamField path="n" type="int" required>
+  The N dimension of the tile.
+</ParamField>
+
+<ResponseField name="returns" type="GmmaLayout">
+  Canonical MN-major layout for operand B.
+</ResponseField>
+
+---
+
+## Swizzle selection reference
+
+The layout family is determined entirely by the tile's *row width in bytes*:
+
+| `row_bytes`        | `LayoutType`  | TMA swizzle | `smem.alloc` argument |
+|--------------------|---------------|-------------|------------------------|
+| 16                 | `INTERLEAVE`  | `"NONE"`    | *(omit)*               |
+| 32                 | `B32`         | `"32B"`     | `swizzle="32B"`        |
+| 64                 | `B64`         | `"64B"`     | `swizzle="64B"`        |
+| 128                | `B128`        | `"128B"`    | `swizzle="128B"`       |
+| > 128 (multi-stripe) | `B128`    | `"128B"`    | `swizzle="128B"`       |
+
+For K-major tiles `row_bytes = k * elem_bytes`. For MN-major tiles `row_bytes = n * elem_bytes`.
+
+Common bf16 (`elem_bytes=2`) tile configurations:
+
+| Tile shape | Major | `row_bytes` | Layout |
+|-----------|-------|-------------|--------|
+| M=64, K=16 | K | 32 | `B32` |
+| M=64, K=32 | K | 64 | `B64` |
+| M=64, K=64 | K | 128 | `B128` |
+| K=16, N=64 | MN | 128 | `B128` |
+| K=16, N=128 | MN | 256 | `B128` (multi-stripe) |
+
+---
+
+## Integration with `smem.wgmma_tile`
+
+```python
+from pyptx import kernel, smem, ptx
+from pyptx.wgmma_layout import layout_for_a, layout_for_b
+from pyptx.types import bf16
+
+la = layout_for_a(dtype=bf16, m=64, k=16)
+lb = layout_for_b(dtype=bf16, k=16, n=128)
+
+@kernel(arch="sm_90a", version=(8, 0))
+def my_gemm_kernel():
+    # Allocate shared memory with the matching swizzle
+    sA = smem.alloc(bf16, (64, 16),  swizzle=la.smem_swizzle)
+    sB = smem.alloc(bf16, (16, 128), swizzle=lb.smem_swizzle)
+
+    # Build wgmma descriptors
+    desc_a = ptx.wgmma.make_descriptor(
+        sA,
+        leading_byte_offset=la.leading_byte_offset,
+        stride_byte_offset=la.stride_byte_offset,
+        swizzle=la.swizzle_code,
+    )
+    desc_b = ptx.wgmma.make_descriptor(
+        sB,
+        leading_byte_offset=lb.leading_byte_offset,
+        stride_byte_offset=lb.stride_byte_offset,
+        swizzle=lb.swizzle_code,
+    )
+    # ... wgmma.mma_async call with desc_a, desc_b ...
+```

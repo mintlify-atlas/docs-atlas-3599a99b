@@ -1,0 +1,349 @@
+---
+title: "PyTorch Runtime Support — pyptx.torch_support"
+description: "API reference for pyptx.torch_support: eager and torch.compile kernel launch, custom_op dispatch, autograd wiring, and the differentiable_kernel helper."
+---
+
+The `pyptx.torch_support` module is the PyTorch-side counterpart to `pyptx.jax_support`. It shares the same C++ shim and PTX compilation machinery, but focuses on the Torch-specific boundary: detecting `torch.Tensor` inputs, collecting device pointers and the active CUDA stream, allocating output tensors, and exposing a `torch.compile`-compatible custom-op wrapper.
+
+Both eager mode and `torch.compile` are supported. The eager path calls `pyptx_shim_launch_raw` via ctypes. The compiled path wraps the kernel in a `torch.library.custom_op` with a fake/meta implementation for Dynamo tracing.
+
+---
+
+## Tensor type detection
+
+### `is_torch_tensor`
+
+```python
+def is_torch_tensor(obj: Any) -> bool
+```
+
+Returns `True` if `obj` is a `torch.Tensor`, `False` otherwise. Safe to call on machines where PyTorch is not installed — returns `False` rather than raising `ImportError`.
+
+<ParamField path="obj" type="Any" required>
+  The object to inspect.
+</ParamField>
+
+<ResponseField name="returns" type="bool">
+  `True` when `obj` is an instance of `torch.Tensor`.
+</ResponseField>
+
+### `any_torch_tensors`
+
+```python
+def any_torch_tensors(inputs: Sequence[Any]) -> bool
+```
+
+Returns `True` if any element of `inputs` is a `torch.Tensor`. Used by `Kernel.__call__` to select between the JAX path and the PyTorch path.
+
+<ParamField path="inputs" type="Sequence[Any]" required>
+  A sequence of potential tensor inputs.
+</ParamField>
+
+<ResponseField name="returns" type="bool">
+  `True` if at least one element is a `torch.Tensor`.
+</ResponseField>
+
+---
+
+## Eager launch
+
+### `call_kernel_via_torch`
+
+```python
+def call_kernel_via_torch(
+    *inputs,
+    cubin_handle: int,
+    out_specs: Sequence[Tile],
+    out_shape_env: dict[str, int],
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+    cluster: tuple[int, int, int] = (1, 1, 1),
+    smem_bytes: int = 0,
+) -> Any
+```
+
+Launches a pyptx kernel immediately using PyTorch tensor inputs, via the shim's raw C entry point `pyptx_shim_launch_raw`.
+
+The function:
+1. Allocates output tensors with the right shapes and dtypes on the same CUDA device as the first input.
+2. Builds a `void**` array of device pointers in inputs-then-outputs order, matching the JAX FFI buffer order so TMA `xla_arg_index` values resolve consistently.
+3. Calls `pyptx_shim_launch_raw(handle, stream, ptrs, n)`.
+4. Returns the output tensor(s).
+
+<ParamField path="inputs" type="torch.Tensor..." required>
+  Contiguous CUDA input tensors.
+</ParamField>
+
+<ParamField path="cubin_handle" type="int" required>
+  The process-local kernel handle from `CubinRegistry.register`.
+</ParamField>
+
+<ParamField path="out_specs" type="Sequence[Tile]" required>
+  Output tensor specifications used to allocate result buffers.
+</ParamField>
+
+<ParamField path="out_shape_env" type="dict[str, int]" required>
+  Mapping of symbolic dimension names to concrete values for resolving output shapes.
+</ParamField>
+
+<ParamField path="grid" type="tuple[int, int, int]" required>
+  Launch grid `(x, y, z)`.
+</ParamField>
+
+<ParamField path="block" type="tuple[int, int, int]" required>
+  Thread-block size `(x, y, z)`.
+</ParamField>
+
+<ParamField path="cluster" type="tuple[int, int, int]">
+  Cluster dimensions for Hopper cluster launches. Default `(1, 1, 1)`.
+</ParamField>
+
+<ParamField path="smem_bytes" type="int">
+  Dynamic shared memory in bytes. Default `0`.
+</ParamField>
+
+<ResponseField name="returns" type="torch.Tensor | tuple[torch.Tensor, ...]">
+  A single tensor when `out_specs` has one entry, otherwise a tuple.
+</ResponseField>
+
+#### C++ extension fast path
+
+If `pyptx/_shim/torch_ext.cpp` exists and can be JIT-compiled via `torch.utils.cpp_extension.load`, the eager path uses the C++ extension instead of ctypes for lower dispatch overhead. The extension is loaded lazily on the first `call_kernel_via_torch` call; if compilation fails it falls back silently to the ctypes path.
+
+---
+
+## `torch.compile` integration
+
+Each `(kernel, cubin_handle)` pair gets a unique `torch.library.custom_op` registered the first time it is called. The op takes a flat list of input tensors and returns a flat list of outputs. A `register_fake` implementation provides Dynamo with output shapes without touching the GPU.
+
+### `get_or_register_torch_op`
+
+```python
+def get_or_register_torch_op(
+    cubin_handle: int,
+    out_specs: Sequence[Tile],
+    out_shape_env: dict[str, int],
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+    cluster: tuple[int, int, int],
+    smem_bytes: int,
+)
+```
+
+Returns a callable `torch.library.custom_op` for this kernel. On the first call with a given `cubin_handle` the op is registered; subsequent calls reuse it. The op's schema is `(Tensor[] inputs) -> Tensor[]`.
+
+<ParamField path="cubin_handle" type="int" required>
+  Process-local kernel handle.
+</ParamField>
+
+<ParamField path="out_specs" type="Sequence[Tile]" required>
+  Output tensor specifications.
+</ParamField>
+
+<ParamField path="out_shape_env" type="dict[str, int]" required>
+  Resolved shape environment for output dimension expressions.
+</ParamField>
+
+<ParamField path="grid" type="tuple[int, int, int]" required>
+  Launch grid.
+</ParamField>
+
+<ParamField path="block" type="tuple[int, int, int]" required>
+  Thread-block size.
+</ParamField>
+
+<ParamField path="cluster" type="tuple[int, int, int]" required>
+  Cluster dimensions.
+</ParamField>
+
+<ParamField path="smem_bytes" type="int" required>
+  Dynamic shared memory in bytes.
+</ParamField>
+
+<ResponseField name="returns" type="Callable">
+  A `torch.library.custom_op` callable with signature `(inputs: list[Tensor]) -> list[Tensor]`.
+</ResponseField>
+
+### `call_kernel_via_torch_compile`
+
+```python
+def call_kernel_via_torch_compile(
+    *inputs,
+    cubin_handle: int,
+    out_specs: Sequence[Tile],
+    out_shape_env: dict[str, int],
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+    cluster: tuple[int, int, int] = (1, 1, 1),
+    smem_bytes: int = 0,
+) -> Any
+```
+
+`torch.compile`-compatible launch path. Calls `get_or_register_torch_op` internally and dispatches through the registered custom op so Dynamo can trace through the kernel call.
+
+<ParamField path="inputs" type="torch.Tensor..." required>
+  Contiguous CUDA input tensors.
+</ParamField>
+
+<ParamField path="cubin_handle" type="int" required>
+  The process-local kernel handle.
+</ParamField>
+
+<ParamField path="out_specs" type="Sequence[Tile]" required>
+  Output tensor specifications.
+</ParamField>
+
+<ParamField path="out_shape_env" type="dict[str, int]" required>
+  Resolved shape environment.
+</ParamField>
+
+<ParamField path="grid" type="tuple[int, int, int]" required>
+  Launch grid.
+</ParamField>
+
+<ParamField path="block" type="tuple[int, int, int]" required>
+  Thread-block size.
+</ParamField>
+
+<ParamField path="cluster" type="tuple[int, int, int]">
+  Cluster dimensions. Default `(1, 1, 1)`.
+</ParamField>
+
+<ParamField path="smem_bytes" type="int">
+  Dynamic shared memory in bytes. Default `0`.
+</ParamField>
+
+<ResponseField name="returns" type="torch.Tensor | tuple[torch.Tensor, ...]">
+  A single tensor for one output, otherwise a tuple.
+</ResponseField>
+
+---
+
+## Autograd support
+
+### `differentiable_kernel`
+
+```python
+def differentiable_kernel(
+    forward_kernel,
+    backward_kernel,
+    *,
+    save_for_backward: Sequence[int] | None = None,
+    num_grad_inputs: int | None = None,
+)
+```
+
+Wraps a forward and backward pyptx kernel pair into a `torch.autograd.Function` so the combined operation participates in PyTorch's autograd graph.
+
+<ParamField path="forward_kernel" type="Kernel" required>
+  A pyptx `Kernel` for the forward pass.
+</ParamField>
+
+<ParamField path="backward_kernel" type="Kernel" required>
+  A pyptx `Kernel` for the backward pass. It is called with `(*saved_tensors, *grad_outputs)` and must return one gradient tensor per differentiable input (or `None` for non-differentiable positions).
+</ParamField>
+
+<ParamField path="save_for_backward" type="Optional[Sequence[int]]">
+  Indices into the forward inputs list that should be saved and passed to the backward kernel. Defaults to saving all inputs.
+</ParamField>
+
+<ParamField path="num_grad_inputs" type="Optional[int]">
+  Number of forward inputs that require gradients. Determines the length of the gradient tuple returned from `backward`. Defaults to the number of forward inputs.
+</ParamField>
+
+<ResponseField name="returns" type="Callable">
+  A Python callable `wrapper(*inputs) -> output` that supports `.backward()`. The wrapper also exposes `wrapper.forward_kernel` and `wrapper.backward_kernel` for inspection.
+</ResponseField>
+
+```python
+from pyptx.torch_support import differentiable_kernel
+
+fwd = build_my_forward(M, N)
+bwd = build_my_backward(M, N)
+
+my_op = differentiable_kernel(
+    fwd, bwd,
+    save_for_backward=[0, 1],  # save inputs at index 0 and 1
+)
+
+x = torch.randn(M, N, device="cuda", requires_grad=True)
+w = torch.randn(N,    device="cuda", requires_grad=True)
+out = my_op(x, w)
+out.sum().backward()
+print(x.grad, w.grad)
+```
+
+The returned wrapper calls `forward_kernel` inside `torch.no_grad()` to avoid recording operations a second time, and likewise calls `backward_kernel` without gradient tracking.
+
+---
+
+## Utility helpers
+
+### `extract_input_shapes`
+
+```python
+def extract_input_shapes(inputs) -> list[tuple[int, ...]]
+```
+
+Returns the concrete shape of each tensor in `inputs` as a list of tuples.
+
+<ParamField path="inputs" type="Sequence[torch.Tensor]" required>
+  A sequence of PyTorch tensors.
+</ParamField>
+
+<ResponseField name="returns" type="list[tuple[int, ...]]">
+  One shape tuple per input tensor.
+</ResponseField>
+
+---
+
+## Dtype mappings
+
+`pyptx.torch_support` maintains bidirectional mappings between pyptx `PtxType` names and `torch.dtype` values:
+
+| PTX type | `torch.dtype`        |
+|----------|----------------------|
+| `f16`    | `torch.float16`      |
+| `bf16`   | `torch.bfloat16`     |
+| `f32`    | `torch.float32`      |
+| `f64`    | `torch.float64`      |
+| `s8`     | `torch.int8`         |
+| `s16`    | `torch.int16`        |
+| `s32`    | `torch.int32`        |
+| `s64`    | `torch.int64`        |
+| `u8`     | `torch.uint8`        |
+| `pred`   | `torch.bool`         |
+
+---
+
+## Example: eager launch with `torch.compile`
+
+```python
+import torch
+from pyptx import kernel
+from pyptx.specs import Tile
+from pyptx.jax_support import compile_ptx_to_cubin, get_cubin_registry, register_launch_config
+from pyptx.torch_support import call_kernel_via_torch_compile
+
+ptx = open("scale.ptx").read()
+cu_fn, cu_mod = compile_ptx_to_cubin(ptx, arch="sm_90a", kernel_name="scale")
+
+registry = get_cubin_registry()
+handle = registry.register(ptx, "scale", cu_function=cu_fn, module=cu_mod,
+                           grid=(64, 1, 1), block=(128, 1, 1))
+register_launch_config(handle, cu_fn, grid=(64, 1, 1), block=(128, 1, 1))
+
+@torch.compile
+def run(x):
+    return call_kernel_via_torch_compile(
+        x,
+        cubin_handle=handle,
+        out_specs=[Tile(dtype="f32", shape=(8192,))],
+        out_shape_env={},
+        grid=(64, 1, 1),
+        block=(128, 1, 1),
+    )
+
+x = torch.randn(8192, device="cuda")
+y = run(x)
+```

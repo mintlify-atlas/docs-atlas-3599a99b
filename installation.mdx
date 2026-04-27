@@ -1,0 +1,96 @@
+---
+title: "Install pyptx on Linux with PyTorch or JAX"
+description: "Install pyptx for PTX authoring only, or add the PyTorch or JAX runtime to launch kernels. Requires Python 3.10+, Linux, and an NVIDIA GPU for execution."
+---
+
+pyptx has zero required dependencies. The base install gives you the DSL, the PTX parser and emitter, and the transpiler — everything short of actually launching a kernel on hardware. Add `[torch]` or `[jax]` when you want GPU execution.
+
+## Install options
+
+<CodeGroup>
+
+```bash Base (DSL only)
+pip install pyptx
+```
+
+```bash PyTorch runtime
+pip install 'pyptx[torch]'
+```
+
+```bash JAX runtime
+pip install 'pyptx[jax]'
+```
+
+```bash Both runtimes
+pip install 'pyptx[all]'
+```
+
+</CodeGroup>
+
+| Variant | What you get |
+| --- | --- |
+| `pyptx` | DSL, `@kernel` tracing, PTX parser, emitter, transpiler — no GPU runtime |
+| `pyptx[torch]` | + PyTorch eager dispatch via `torch.library.custom_op` and `torch.compile` |
+| `pyptx[jax]` | + `jax.jit` launch path via XLA typed FFI (`jax[cuda12]>=0.4.20`, `cuda-python>=12.3`) |
+| `pyptx[all]` | + both PyTorch and JAX |
+
+If you only want to read PTX, prototype kernel structure, or run the transpiler without a GPU, `pip install pyptx` is sufficient.
+
+## PyTorch runtime
+
+Installing `pyptx[torch]` pulls in `torch>=2.1`. On first launch, pyptx JIT-compiles a small C++ extension (`pyptx/_shim/torch_ext.cpp`) that reduces dispatch overhead from ~34 µs to ~14 µs.
+
+<Tip>
+  Install `ninja` before your first kernel launch to ensure the C++ extension builds on first use rather than falling back to the slower ctypes path:
+
+  ```bash
+  pip install ninja
+  pip install 'pyptx[torch]'
+  ```
+
+  With `ninja` present, dispatch overhead is ~14 µs. Without it, pyptx silently falls back to ~34 µs. CUDA graph replay brings this down to ~4 µs regardless.
+</Tip>
+
+## JAX runtime
+
+Installing `pyptx[jax]` pulls in `jax[cuda12]>=0.4.20` and `cuda-python>=12.3`. Kernels register as typed FFI handlers that execute inside `jax.jit`.
+
+<Warning>
+  On Blackwell hardware (B200) running CUDA 13 / driver ≥ 575, the CUDA 12 jaxlib build will fail to launch with `CUDA_ERROR_INVALID_CONTEXT`. Install the CUDA 13 build instead:
+
+  ```bash
+  pip install 'jax[cuda13]'
+  ```
+
+  If the host also runs other CUDA processes (vLLM, etc.) that already claim HBM, set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.2` or `XLA_PYTHON_CLIENT_PREALLOCATE=false` to avoid OOM on JAX initialization.
+</Warning>
+
+## Requirements
+
+- **Python** ≥ 3.10 (3.10, 3.11, 3.12, 3.13 are tested)
+- **OS** Linux only (the C++ launch shim and JAX FFI header are Linux-specific)
+- **GPU** for running kernels:
+  - Hopper examples (`examples/hopper/`) require `sm_90a` — an H100 or H200
+  - Blackwell examples (`examples/blackwell/`) require `sm_100a` — a B200
+- **CUDA driver** only (not the full toolkit); pyptx JITs PTX via `cuModuleLoadData` and has no `ptxas` dependency at install time
+
+## Editable install and the launch shim
+
+For development, install editable and build the launch shim once:
+
+```bash
+pip install -e '.[all]'
+cd pyptx/_shim
+bash build.sh
+```
+
+The shim needs `jaxlib` installed for the XLA FFI header. If you only need the PyTorch path, skip `build.sh` — the torch extension JIT-compiles on first use.
+
+## System Python on Debian/Ubuntu
+
+Debian-derived distros ship a PEP 668 "externally-managed" Python. If you see `error: externally-managed-environment`, use a virtual environment:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install 'pyptx[all]'
+```

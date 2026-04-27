@@ -1,0 +1,272 @@
+---
+title: "PTX Transpiler and Codegen — pyptx.codegen"
+description: "API reference for pyptx.codegen: transpile PTX assembly to pyptx Python DSL code with ptx_to_python, the sugar pass, and the CLI for batch conversion."
+---
+
+The `pyptx.codegen` module is pyptx's PTX-to-Python transpiler. It parses raw PTX assembly, optionally applies a sugar pass that cleans up names and recognises high-level patterns, then emits idiomatic pyptx DSL code that can be executed directly. This makes it the fastest onramp for working with existing CUDA kernels inside pyptx.
+
+---
+
+## Module structure
+
+```
+pyptx/codegen/
+├── __init__.py    — public exports: ptx_to_python, ir_to_python
+├── __main__.py    — CLI entry point
+├── codegen.py     — core transpiler: parse → IR → Python
+└── sugar.py       — sugar pass: name cleanup, loop detection, warp-split annotation
+```
+
+---
+
+## Public API
+
+### `ptx_to_python`
+
+```python
+from pyptx.codegen import ptx_to_python
+
+def ptx_to_python(
+    source: str,
+    *,
+    sugar: bool = False,
+    kernel_name: str = "matmul_kernel",
+) -> str
+```
+
+Converts PTX source text to pyptx Python DSL code. This is the primary entry point for the transpiler.
+
+<ParamField path="source" type="str" required>
+  Raw PTX assembly text. Typically the contents of a `.ptx` file.
+</ParamField>
+
+<ParamField path="sugar" type="bool">
+  When `True`, applies the sugar pass before code generation. The sugar pass:
+  - Demangles C++ symbol names (Itanium ABI `_ZN...E` → short identifier).
+  - Renames labels from `$L__BB13_2` to `BB2`.
+  - Cleans up `extern .shared` symbol names.
+  - Renames the kernel function to `kernel_name`.
+  - Folds single-use temporary registers into nested `ptx.inst.*` calls.
+  - Emits `with ptx.loop(...)` for detected backward-branch loops.
+  - Generates `for _i in range(N)` for repeated instruction groups.
+  - Collapses `mbarrier.try_wait` spin-loops to `ptx.mbarrier.wait(addr, phase)`.
+
+  Default `False`.
+</ParamField>
+
+<ParamField path="kernel_name" type="str">
+  Name to assign to the kernel function when `sugar=True`. Default `"matmul_kernel"`.
+</ParamField>
+
+<ResponseField name="returns" type="str">
+  A Python source string ready for `exec()` or writing to a `.py` file. The string starts with imports and contains one `@kernel(...)` decorated function per PTX entry in `source`.
+</ResponseField>
+
+```python
+from pyptx.codegen import ptx_to_python
+
+ptx = open("vector_add.ptx").read()
+
+# Raw transpilation (no name cleanup)
+raw_py = ptx_to_python(ptx)
+
+# Cleaned-up output with loop detection
+sugar_py = ptx_to_python(ptx, sugar=True, kernel_name="vector_add")
+print(sugar_py)
+```
+
+---
+
+### `ir_to_python`
+
+```python
+from pyptx.codegen import ir_to_python
+
+def ir_to_python(module: Module, *, sugar: bool = False) -> str
+```
+
+Converts a pre-parsed `pyptx.ir.nodes.Module` IR object directly to Python code, bypassing the parsing step. Useful when you already hold a Module from `pyptx.parser.parse` and want to re-emit it.
+
+<ParamField path="module" type="pyptx.ir.nodes.Module" required>
+  A parsed PTX IR module.
+</ParamField>
+
+<ParamField path="sugar" type="bool">
+  Enable the same sugar rewrites as `ptx_to_python(sugar=True)`. The sugar pass is *not* re-applied to the module at this stage — it must have been applied separately via `apply_sugar` if desired. This flag only affects the code emitter. Default `False`.
+</ParamField>
+
+<ResponseField name="returns" type="str">
+  Python source text.
+</ResponseField>
+
+---
+
+## Sugar pass
+
+### `apply_sugar`
+
+```python
+from pyptx.codegen.sugar import apply_sugar
+
+def apply_sugar(module: Module, *, kernel_name: str = "matmul_kernel") -> Module
+```
+
+Applies all sugar rewrites to a parsed Module and returns a new Module. The original Module is not modified (uses `dataclasses.replace` throughout).
+
+<ParamField path="module" type="pyptx.ir.nodes.Module" required>
+  The parsed PTX IR module to rewrite.
+</ParamField>
+
+<ParamField path="kernel_name" type="str">
+  The clean name to assign to the first (and usually only) kernel entry. Default `"matmul_kernel"`.
+</ParamField>
+
+<ResponseField name="returns" type="pyptx.ir.nodes.Module">
+  A new Module with all renames applied. The emitted PTX from the sugared module is semantically identical to the original — only symbol and label names differ.
+</ResponseField>
+
+#### Sugar rewrites performed
+
+| Category | Before | After |
+|----------|--------|-------|
+| Function name | `_ZN3M1214matmulKernelILi128EE...` | `matmul_kernel` |
+| Labels | `$L__BB13_2` | `BB2` |
+| Shared memory | `_ZN3M124smemE` | `smem` |
+| u32 params | `_param_0`, `_param_1` | `M`, `N`, `K` |
+| TMA params (128-byte) | `_param_3` | `tma_C`, `tma_A`, `tma_B` |
+| u64 pointer params | `_param_6` | `hilbert_ptr` |
+
+---
+
+## Output format
+
+The generated Python imports `kernel`, `reg`, `smem`, and `ptx` from `pyptx`, then declares only the type names actually used in the kernel body. Each PTX entry becomes a `@kernel(...)` decorated function.
+
+**Without sugar (`sugar=False`):**
+
+```python
+from pyptx import kernel, reg, smem, ptx
+from pyptx.types import bf16, f32, u32, u64, pred
+
+@kernel(arch="sm_90a", version=(8, 0), raw_params=[("u32", "_param_0"), ...])
+def _ZN3M1214matmulKernelILi128EEjjjE():
+    r = reg.array(u32, 512, name="%r")
+    p = reg.array(pred, 16,  name="%p")
+    ptx.inst.mov.u32(r[0], ptx.special.tid.x())
+    ptx.inst.setp.lt.s32(p[0], r[0], r[1])
+    ptx.bra("$L__BB0_1", pred=~p[0])
+    # ...
+```
+
+**With sugar (`sugar=True`, `kernel_name="my_gemm"`):**
+
+```python
+from pyptx import kernel, reg, smem, ptx
+from pyptx.types import bf16, f32, u32, u64
+
+@kernel(arch="sm_90a", version=(8, 0), raw_params=[("u32", "M"), ("u32", "N"), ("u32", "K")])
+def my_gemm():
+    r = reg.array(u32, 512, name="%r")
+    p = reg.array(pred, 16,  name="%p")
+    ptx.inst.mov.u32(r[0], ptx.special.tid.x())
+
+    # === LOOP (48 instructions, counts down) ===
+    with ptx.loop("BB1"):
+        # --- wgmma compute ---
+        ptx.inst.wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16(
+            [f[i] for i in range(0, 64)], desc_A, desc_B, 1, 1, 1, 1, 1)
+        ptx.mbarrier.wait(ptx.addr(r[12]), r[13])
+        ptx.inst.sub.s32(r[20], r[20], 1)
+        ptx.bra("BB1", pred=~p[0])
+```
+
+---
+
+## CLI
+
+```bash
+python -m pyptx.codegen <file.ptx> [--sugar] [--name NAME]
+```
+
+Prints the generated Python to stdout.
+
+| Argument | Description |
+|----------|-------------|
+| `<file.ptx>` | Path to the PTX source file (required). |
+| `--sugar` | Enable the sugar pass (name cleanup, loop detection). |
+| `--name NAME` | Kernel name to use when `--sugar` is set. Default `"matmul_kernel"`. |
+
+```bash
+# Basic transpilation
+python -m pyptx.codegen kernel.ptx > kernel.py
+
+# With sugar and a custom function name
+python -m pyptx.codegen kernel.ptx --sugar --name my_kernel > kernel.py
+```
+
+---
+
+## Special register mappings
+
+The transpiler automatically maps well-known PTX special registers to their pyptx DSL equivalents:
+
+| PTX register | Generated Python |
+|---|---|
+| `%tid.x` | `ptx.special.tid.x()` |
+| `%tid.y` | `ptx.special.tid.y()` |
+| `%ctaid.x` | `ptx.special.ctaid.x()` |
+| `%laneid` | `ptx.special.laneid()` |
+| `%warpid` | `ptx.special.warpid()` |
+| `%clock` | `ptx.special.clock()` |
+| `%cluster_ctarank`, etc. | `ptx.sreg("%cluster_ctarank")` |
+
+Python keywords used as PTX opcode modifiers (e.g. `.and`, `.or`, `.not`) get a trailing underscore: `ptx.inst.and_.b32(...)`.
+
+---
+
+## Complete example
+
+```python
+from pyptx.codegen import ptx_to_python
+
+ptx_source = """
+.version 8.0
+.target sm_90a
+.address_size 64
+
+.visible .entry vector_add(
+    .param .u64 .ptr.global.align 16 _param_0,
+    .param .u64 .ptr.global.align 16 _param_1,
+    .param .u64 .ptr.global.align 16 _param_2,
+    .param .u32 _param_3
+)
+{
+    .reg .u32 %r<4>;
+    .reg .u64 %rd<8>;
+    .reg .f32 %f<4>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd0, [_param_0];
+    ld.param.u64 %rd1, [_param_1];
+    ld.param.u64 %rd2, [_param_2];
+    ld.param.u32 %r0, [_param_3];
+    mov.u32 %r1, %tid.x;
+    setp.lt.u32 %p0, %r1, %r0;
+    @!%p0 bra EXIT;
+    cvt.u64.u32 %rd3, %r1;
+    mul.wide.u32 %rd4, %r1, 4;
+    add.u64 %rd5, %rd0, %rd4;
+    add.u64 %rd6, %rd1, %rd4;
+    add.u64 %rd7, %rd2, %rd4;
+    ld.global.f32 %f0, [%rd5];
+    ld.global.f32 %f1, [%rd6];
+    add.f32 %f2, %f0, %f1;
+    st.global.f32 [%rd7], %f2;
+EXIT:
+    ret;
+}
+"""
+
+python_code = ptx_to_python(ptx_source, sugar=True, kernel_name="vector_add")
+print(python_code)
+```

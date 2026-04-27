@@ -1,0 +1,307 @@
+---
+title: "smem — shared memory allocation and barriers"
+description: "Reference for pyptx.smem: allocating shared-memory regions, WGMMA tiles, mbarrier arrays, and the SharedAlloc, SharedSlice, MbarrierArray, and MbarrierRef objects."
+---
+
+The `smem` module manages shared-memory allocation for pyptx kernels. Allocations are tracked in a per-trace offset table so that each region gets a unique symbol or dynamic-smem offset, and barriers are sized and aligned automatically.
+
+```python
+from pyptx import smem
+from pyptx.types import bf16, f32
+
+STAGES = 3
+BM, BK, BN = 64, 64, 256
+
+sA    = smem.alloc(bf16, (STAGES, BM, BK), swizzle="128B")
+sB    = smem.wgmma_tile(bf16, (BK, BN), major="MN")
+bar   = smem.mbarrier(STAGES)
+```
+
+When total shared memory exceeds 48 KB, pyptx automatically switches to `extern .shared .b8 dyn_smem[]` mode and rewrites all allocations to offset-based addressing.
+
+---
+
+## Allocation functions
+
+### `smem.alloc(dtype, shape, swizzle=None, align=None, name=None) → SharedAlloc`
+
+Allocate a general-purpose shared-memory region.
+
+Emits: `.shared [.align N] .b8 name[bytes];`
+
+<ParamField path="dtype" type="PtxType" required>
+  Element type, e.g. `bf16`, `f32`.
+</ParamField>
+
+<ParamField path="shape" type="tuple[int, ...] | int" required>
+  Shape as a tuple `(STAGES, BM, BK)` or a flat element count. The byte count is `prod(shape) * dtype.bits // 8`.
+</ParamField>
+
+<ParamField path="swizzle" type="str | None" default="None">
+  Swizzle mode metadata: `"32B"`, `"64B"`, `"128B"`, or `None`. Recorded on the `SharedAlloc` for use by `ptx.wgmma.auto_descriptor` and `smem.apply_swizzle`. Does not change the emitted `.shared` declaration.
+</ParamField>
+
+<ParamField path="align" type="int | None" default="128">
+  Byte alignment. Defaults to 128. Must be a power of two.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Symbol name. Auto-generated (`smem_0`, `smem_1`, ...) if `None`.
+</ParamField>
+
+```python
+sA = smem.alloc(bf16, (3, 64, 64), swizzle="128B")
+scratch = smem.alloc(f32, (128, 128))
+```
+
+---
+
+### `smem.wgmma_tile(dtype, shape, major="K", *, align=None, name=None) → SharedAlloc`
+
+Allocate a shared-memory tile in the canonical GMMA operand layout. Automatically selects the correct swizzle mode and alignment for the given dtype and shape.
+
+The returned `SharedAlloc` has `.gmma_layout` set, so `ptx.wgmma.auto_descriptor` can derive the 64-bit descriptor without any manual LBO/SBO math.
+
+<ParamField path="dtype" type="PtxType" required>
+  Element type: `bf16`, `f16`, `tf32`, or `f32`.
+</ParamField>
+
+<ParamField path="shape" type="tuple[int, int]" required>
+  `(M, K)` for a K-major A operand (`major="K"`), or `(K, N)` for an MN-major B operand (`major="MN"`).
+</ParamField>
+
+<ParamField path="major" type="str" default='"K"'>
+  `"K"` — row-major MxK for A / col-major KxN for B.  
+  `"MN"` — col-major MxK for A / row-major KxN for B.
+</ParamField>
+
+```python
+sA = smem.wgmma_tile(bf16, (64, 64),  major="K")   # A operand
+sB = smem.wgmma_tile(bf16, (64, 256), major="MN")  # B operand
+```
+
+---
+
+### `smem.mbarrier(count, name=None) → MbarrierArray`
+
+Allocate an array of mbarrier objects in shared memory.
+
+Static mode emits `.shared .b64 name[count];`. Dynamic mode (`force_dynamic_smem`) stores barriers at `dyn_smem + byte_offset`.
+
+<ParamField path="count" type="int" required>
+  Number of mbarrier objects. Each mbarrier is 8 bytes, aligned to 8 bytes.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Symbol name. Auto-generated (`mbar_0`, `mbar_1`, ...) if `None`.
+</ParamField>
+
+```python
+bar_full  = smem.mbarrier(STAGES)   # one per pipeline stage
+bar_empty = smem.mbarrier(STAGES)
+```
+
+---
+
+## Low-level helpers
+
+### `smem.base(name=None) → Reg`
+
+Return a `u32` register holding the base address of the extern shared memory symbol. Useful when using `extern_smem=True` on the `@kernel` decorator.
+
+```python
+base = smem.base()           # loads "smem" or the configured symbol
+base = smem.base("my_smem")
+```
+
+### `smem.load(dtype, address) → Reg`
+
+Emit `ld.shared.{dtype}` and return the loaded register.
+
+```python
+val = smem.load(f32, ptx.addr(sh_addr))
+```
+
+### `smem.store(dtype, address, value) → None`
+
+Emit `st.shared.{dtype}`.
+
+```python
+smem.store(f32, ptx.addr(sh_addr), val_reg)
+```
+
+### `smem.apply_swizzle(logical_offset, swizzle) → Reg`
+
+Apply a GMMA swizzle transform to a logical byte offset. Emits three ALU instructions (`and`, `shr`, `xor`) for the CUTLASS `Swizzle<B,M,S>` pattern. Pass `None` or `"NONE"` for the identity.
+
+```python
+phys_off = smem.apply_swizzle(log_off, "128B")
+```
+
+---
+
+## `SharedAlloc` object
+
+Handle to a shared memory allocation.
+
+<ResponseField name="name" type="str">
+  PTX symbol name (static mode) or `"dyn_smem"` (dynamic mode).
+</ResponseField>
+
+<ResponseField name="dtype" type="PtxType">
+  Element type of the allocation.
+</ResponseField>
+
+<ResponseField name="shape" type="tuple[int, ...]">
+  Shape as declared at allocation time.
+</ResponseField>
+
+<ResponseField name="swizzle" type="str | None">
+  Swizzle mode metadata string.
+</ResponseField>
+
+<ResponseField name="byte_offset" type="int">
+  Byte offset within `dyn_smem` (dynamic mode), or the cumulative static offset used for address calculations.
+</ResponseField>
+
+<ResponseField name="gmma_layout" type="GmmaLayout | None">
+  Set when the allocation was produced by `smem.wgmma_tile`. Used by `ptx.wgmma.auto_descriptor` to build the 64-bit WGMMA descriptor.
+</ResponseField>
+
+<ResponseField name="gmma_major" type="str | None">
+  `"K"` or `"MN"` from `smem.wgmma_tile`.
+</ResponseField>
+
+**Stage indexing** — `sA[stage]` returns a `SharedSlice`:
+
+```python
+sA = smem.alloc(bf16, (STAGES, BM, BK), swizzle="128B")
+
+# Pass a stage-indexed slice to TMA / wgmma instructions
+ptx.cp.async_.bulk.tensor_2d(dst=sA[stage], src=A.tma_desc(), ...)
+a_desc = ptx.wgmma.auto_descriptor(sA[stage], dtype=bf16, shape=(BM, BK), major="K")
+```
+
+**2D element access** — `sA[row, col]` emits `ld.shared.{dtype}`:
+
+```python
+# Row-major load (no swizzle awareness — for scratch buffers, not WGMMA tiles)
+val = sA[row_reg, col_reg]    # emits ld.shared.bf16
+sA[row_reg, col_reg] = val    # emits st.shared.bf16
+```
+
+---
+
+## `SharedSlice` object
+
+A stage-indexed view of a `SharedAlloc`. Returned by `sA[stage]`.
+
+<ResponseField name="name" type="str">
+  Same symbol name as the parent `SharedAlloc`.
+</ResponseField>
+
+<ResponseField name="alloc" type="SharedAlloc">
+  Back-reference to the parent allocation.
+</ResponseField>
+
+<ResponseField name="stage" type="int">
+  Stage index.
+</ResponseField>
+
+---
+
+## `MbarrierArray` object
+
+Array of mbarrier objects in shared memory. Returned by `smem.mbarrier(count)`.
+
+<ResponseField name="name" type="str">
+  PTX symbol name or `"dyn_smem"`.
+</ResponseField>
+
+<ResponseField name="count" type="int">
+  Number of mbarrier objects.
+</ResponseField>
+
+<ResponseField name="byte_offset" type="int">
+  Base byte offset within dynamic smem (static allocations: `0`).
+</ResponseField>
+
+**Indexing** returns a `MbarrierRef`:
+
+```python
+bar_full[0]   # MbarrierRef for stage 0
+bar_full[2]   # MbarrierRef for stage 2
+```
+
+---
+
+## `MbarrierRef` object
+
+Reference to a single mbarrier object. Passed to `ptx.mbarrier.*` calls.
+
+<ResponseField name="name" type="str">
+  Symbol name of the parent array.
+</ResponseField>
+
+<ResponseField name="byte_offset" type="int">
+  `array.byte_offset + idx * 8`. Used by instruction emitters for dynamic-smem addressing.
+</ResponseField>
+
+---
+
+## Complete pipeline example
+
+```python
+from pyptx import kernel, reg, smem, ptx, Tile, Layout
+from pyptx.types import bf16, f32, u32
+
+STAGES = 3
+
+@kernel(
+    in_specs=(Tile.wgmma_a("M", "K", bf16, tile_k=64),),
+    out_specs=(Tile("M", "N", f32, Layout.ROW),),
+    grid=lambda M, N, K: (M // 64, N // 256),
+    block=(128, 1, 1),
+    arch="sm_90a",
+)
+def pipelined_gemm(A, C, *, BM=64, BN=256, BK=64):
+    px, py = ptx.global_ptrs(A, C)
+
+    # Shared memory layout
+    sA       = smem.wgmma_tile(bf16, (BM, BK), major="K")
+    bar_full = smem.mbarrier(STAGES)
+    bar_empt = smem.mbarrier(STAGES)
+
+    acc = reg.wgmma_frag(m=BM, n=BN, dtype=f32)
+
+    # Initialize barriers
+    for i in range(STAGES):
+        ptx.mbarrier.init(bar_full[i], count=1)
+        ptx.mbarrier.init(bar_empt[i], count=128)
+    ptx.fence.proxy_async_shared_cta()
+
+    # Pipeline loop
+    stage  = reg.scalar(u32, init=0)
+    phase  = reg.scalar(u32, init=0)
+
+    for k in ptx.range_(0, "K", BK):
+        # Issue TMA load
+        ptx.mbarrier.arrive_expect_tx(bar_full[stage], BM * BK * 2)
+        ptx.cp.async_.bulk.tensor_2d(
+            dst=sA[stage], src=A.tma_desc(), coord=(k, 0), mbar=bar_full[stage]
+        )
+
+        # Wait for load
+        ptx.mbarrier.wait(bar_full[stage], phase)
+
+        # Build descriptor and issue WGMMA
+        a_desc = ptx.wgmma.auto_descriptor(sA[stage], dtype=bf16, shape=(BM, BK), major="K")
+        ptx.wgmma.mma_async(
+            shape=(BM, BN, BK), dtype_d=f32, dtype_a=bf16, dtype_b=bf16,
+            d=acc, a=a_desc, b=a_desc, scale_d=True,
+        )
+        ptx.wgmma.commit_group()
+        ptx.wgmma.wait_group(0)
+
+    ptx.ret()
+```

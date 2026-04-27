@@ -1,0 +1,235 @@
+---
+title: "Tiles, Layouts, and TMA Descriptors in pyptx"
+description: "How Tile specs, Layout values, tma_box, and smem.wgmma_tile compose into a correct TMA descriptor and matching SMEM allocation for Hopper and Blackwell kernels."
+---
+
+Every `@kernel` decorator opens with a set of `in_specs` and `out_specs`. These are not just type annotations — each `Tile` does three things at once: declares the tensor shape contract, records the element dtype, and encodes the TMA descriptor the framework will build at launch. This page explains each piece and when to choose which option.
+
+## What a Tile Does
+
+```python
+@kernel(
+    in_specs=(
+        Tile.wgmma_a(M, K, bf16, tile_m=BM, tile_k=tile_k),
+        Tile.wgmma_b(K, N, bf16, tile_k=tile_k, tile_n=BN),
+    ),
+    out_specs=(Tile(M, N, f32, Layout.ROW),),
+    grid=(N // BN, M // BM, 1),
+    block=(128, 1, 1),
+    arch="sm_90a",
+)
+def gemm(A, B, D):
+    ...
+```
+
+A `Tile` in an `@kernel` spec serves three roles simultaneously:
+
+1. **Shape contract.** Tells the framework what shape of JAX/PyTorch tensor the kernel accepts. Symbolic dims like `"M"` or `"K"` are bound at call time from the actual tensor shape.
+2. **Dtype.** The element type — `bf16`, `f32`, `b32`, etc. Must match the runtime array dtype exactly.
+3. **TMA descriptor specification.** For input tiles, the `Layout` plus `tma_box` determine the TMA descriptor built at launch and handed to the kernel as `tensor.tma_desc()` inside the body.
+
+Output specs only use (1) and (2) — outputs are written via plain `st.global.*`, not TMA.
+
+## Layout Values
+
+```python
+from pyptx.specs import Layout
+
+class Layout(Enum):
+    ROW          = "row"          # row-major (C order), no swizzle
+    COL          = "col"          # column-major (Fortran order)
+    TMA_128B     = "tma_128b"     # TMA 128-byte swizzle
+    TMA_64B      = "tma_64b"      # TMA 64-byte swizzle
+    TMA_32B      = "tma_32b"      # TMA 32-byte swizzle
+    INTERLEAVED  = "interleaved"  # CUTLASS interleaved
+```
+
+The three values you use in almost every kernel:
+
+<CardGroup cols={3}>
+  <Card title="Layout.ROW" icon="table">
+    The default. Use for outputs and for non-MMA inputs (element-wise kernels like RMS Norm). No swizzle, plain row-major DRAM walk.
+  </Card>
+  <Card title="Layout.TMA_128B" icon="table-columns">
+    The canonical WGMMA/tcgen05 input swizzle. Required for bf16/f16 operands with row width ≥ 128 bytes (N ≥ 64 for bf16). TMA writes a permuted pattern that WGMMA/tcgen05 reads back as logical row-major.
+  </Card>
+  <Card title="TMA_64B / TMA_32B" icon="table-cells">
+    Smaller swizzle variants for narrower rows. Usually picked automatically by `Tile.wgmma_a` / `Tile.wgmma_b`. Reach for these manually only with unusual operand shapes.
+  </Card>
+</CardGroup>
+
+## The Swizzle Matching Rule
+
+<Warning>
+**The TMA swizzle and the SMEM swizzle must be the same.**
+
+TMA writes into SMEM using one permutation. WGMMA reads from SMEM using another. These compose to identity — giving back logical row-major — only if they're the same swizzle family. Mismatched swizzles produce garbage output with no crash.
+</Warning>
+
+In practice, the `wgmma_*` shortcuts enforce this for you:
+
+```python
+# In the @kernel spec:
+Tile.wgmma_a(M, K, bf16, tile_m=BM, tile_k=tile_k)   # → Layout.TMA_128B
+
+# In the kernel body:
+sA = smem.wgmma_tile(bf16, (BM, tile_k), major="K")  # → also 128B swizzle
+```
+
+`Tile.wgmma_a` picks `Layout.TMA_128B` when the inner row is ≥ 128 bytes; `smem.wgmma_tile` picks its swizzle from the same tile shape. They match by construction. If you build the TMA and SMEM sides by hand without the `wgmma_*` shortcuts, **you are responsible for matching them**.
+
+## When to Use Each Tile Constructor
+
+| Situation | Constructor | Notes |
+|---|---|---|
+| A operand feeding WGMMA or tcgen05 | `Tile.wgmma_a(M, K, bf16, tile_m=BM, tile_k=BK)` | Picks `Layout.TMA_*B` and sets `tma_box` |
+| B operand feeding WGMMA or tcgen05 | `Tile.wgmma_b(K, N, bf16, tile_k=BK, tile_n=BN)` | Same |
+| Output tensor | `Tile(M, N, f32, Layout.ROW)` | No TMA, plain `st.global.*` |
+| Non-MMA input (RMS Norm, SwiGLU) | `Tile(B, N, f32)` | Row-major, loaded via `ld.global.*` |
+| Explicit layout control (Blackwell) | `Tile(M, K, bf16, Layout.TMA_128B, tma_box=(BM, BK))` | Same as wgmma_a but visible |
+
+## tma_box: The Per-Load Box Shape
+
+The TMA descriptor knows two shapes:
+
+- The **tensor shape** — the full tensor in DRAM (M × K).
+- The **box shape** — how much one TMA load brings in per call.
+
+`tma_box=(BM, BK)` means: each `ptx.cp.async_.bulk.tensor_2d(...)` call transfers `BM × BK` elements.
+
+```python
+@kernel(
+    in_specs=(
+        Tile(M, K, bf16, Layout.TMA_128B, tma_box=(BM, BK)),
+    ),
+)
+def my_kernel(A, D):
+    sA = smem.alloc(bf16, (BM, BK))
+    # Each TMA load = BM * BK * 2 bytes
+    ptx.cp.async_.bulk.tensor_2d(
+        dst=sA[0], src=A.tma_desc(),
+        coord=(k_off, m_base), mbar=bar[0],
+    )
+```
+
+The coordinates are the **top-left corner** of the box in the source tensor's coordinate system. The TMA engine transfers exactly `tma_box` elements from that corner.
+
+**Picking the box:**
+
+- Match your SMEM tile size. If SMEM is `(BM, BK)`, `tma_box` should be `(BM, BK)`.
+- The innermost box dim × dtype size must be a multiple of 16 bytes (`BK * sizeof(dtype) % 16 == 0`). For bf16 that means `BK % 8 == 0`.
+- When `tma_box=None` (the default), the descriptor uses the full tensor shape — one load brings everything. Useful only for tiny buffers.
+
+## Symbolic vs Concrete Dimensions
+
+Shape dims can be ints or strings:
+
+```python
+Tile("M", "K", bf16, Layout.ROW)   # symbolic: bound at call time
+Tile(64, 16, bf16, Layout.ROW)     # concrete: fixed at decoration time
+```
+
+pyptx is **shape-specialized** — each combination of concrete dims produces its own PTX. A call with `M=2048, K=8192` and a call with `M=4096, K=8192` each get their own trace and cubin.
+
+For performance-critical kernels, the common pattern is to make **tile sizes concrete** and **tensor sizes symbolic**:
+
+```python
+# BM, BN, BK are ints baked in at build time
+# M, N, K are strings resolved at call time
+def build_gemm(M: int, N: int, K: int):
+    BM, BN, BK = 64, 64, 16
+    @kernel(
+        in_specs=(
+            Tile.wgmma_a(M, K, bf16, tile_m=BM, tile_k=BK),
+            Tile.wgmma_b(K, N, bf16, tile_k=BK, tile_n=BN),
+        ),
+        out_specs=(Tile(M, N, f32),),
+        grid=(N // BN, M // BM, 1),
+        block=(128, 1, 1),
+        arch="sm_90a",
+    )
+    def gemm(A, B, D):
+        ...
+    return gemm
+```
+
+## Full Annotated Example
+
+The Hopper GEMM decorator, piece by piece:
+
+```python
+@kernel(
+    in_specs=(
+        Tile.wgmma_a(M, K, bf16, tile_m=64, tile_k=16),
+        # A is M×K bf16, K-major. TMA box is 64×16 = 2 KB.
+        # SMEM allocation: smem.wgmma_tile(bf16, (64, 16), major="K")
+        # Swizzle: TMA_128B (row_bytes = 16 * 2 = 32 → TMA_32B, but 64-wide = TMA_128B for ≥128B rows)
+
+        Tile.wgmma_b(K, N, bf16, tile_k=16, tile_n=64),
+        # B is K×N bf16, MN-major. TMA box is 16×64 = 2 KB.
+        # SMEM allocation: smem.wgmma_tile(bf16, (16, 64), major="MN")
+    ),
+    out_specs=(Tile(M, N, f32),),
+    # D is M×N f32, row-major. Written via st.global.f32.
+
+    grid=(N // 64, M // 64, 1),
+    # One CTA per 64×64 tile of D.
+
+    block=(128, 1, 1),
+    # 128 threads = one Hopper warpgroup (required for WGMMA).
+
+    arch="sm_90a",
+    # sm_100a for Blackwell.
+)
+```
+
+## 2D vs 3D TMA
+
+<Tabs>
+  <Tab title="2D (default)">
+    Standard rank-2 descriptor. Every maintained example uses this.
+
+    ```python
+    Tile(M, K, bf16, Layout.TMA_128B, tma_box=(BM, BK))
+    # → ptx.cp.async_.bulk.tensor_2d(dst, src, coord=(k, m), mbar=bar)
+    ```
+  </Tab>
+  <Tab title="3D (Hopper high-perf)">
+    Rank-3 descriptor with an explicit minor axis. Used by `gemm_highperf_hopper.py` for larger blocks with less padding overhead. Set `tma_rank=3` on the Tile.
+
+    ```python
+    Tile("M", "K", bf16, Layout.TMA_128B, tma_box=(BM, BK), tma_rank=3)
+    # → ptx.cp.async_.bulk.tensor_3d(...) — subtle perf win for large tiles
+    ```
+
+    For grouped GEMM, 3D TMA is not needed. Per-group offset math lives in the kernel body and the descriptor stays 2D.
+  </Tab>
+</Tabs>
+
+## Checklist for a New Kernel's Tile Specs
+
+Before writing the kernel body:
+
+1. **What are the tensor shapes?** Write them as `Tile(..., dtype, layout)`. Pick symbolic vs concrete per dim.
+2. **Do any inputs feed WGMMA or tcgen05?** → Use `Tile.wgmma_a` / `Tile.wgmma_b`. Allocate SMEM with `smem.wgmma_tile(..., major=...)`.
+3. **What's the per-load TMA box?** Match your SMEM tile. Check `BK * sizeof(dtype) % 16 == 0`.
+4. **Output dtype match?** The kernel writes `f32`; the output spec says `f32`. No implicit casts.
+5. **Grid shape?** `(N // BN, M // BM, ...)` for a standard output-tiling GEMM.
+6. **Block size?** 128 for a single warpgroup (WGMMA). 256 for two warpgroups. Other counts for non-MMA kernels.
+
+## What To Read Next
+
+<CardGroup cols={2}>
+  <Card title="Mbarriers and Async Sync" href="/guides/mbarriers">
+    What mbar= does and how mbarrier.wait connects to TMA completion.
+  </Card>
+  <Card title="Registers and Shared Memory" href="/guides/registers-and-smem">
+    The SMEM side of the TMA → SMEM → WGMMA pipeline in detail.
+  </Card>
+  <Card title="Hopper GEMM" href="/guides/handwritten-gemm">
+    A complete kernel using Tile.wgmma_a/b, smem.wgmma_tile, and ptx.wgmma.mma_async.
+  </Card>
+  <Card title="Blackwell GEMM" href="/guides/blackwell-gemm">
+    Explicit Layout.TMA_128B with tma_box on sm_100a.
+  </Card>
+</CardGroup>

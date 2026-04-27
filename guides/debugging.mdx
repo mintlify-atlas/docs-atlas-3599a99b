@@ -1,0 +1,227 @@
+---
+title: "Debugging pyptx Kernels: Tools and Runbook"
+description: "How to inspect generated PTX, validate with ptxas, use CUDA_LAUNCH_BLOCKING, diagnose illegal memory access, silent wrong output, deadlocked mbarriers, and dynamic SMEM errors."
+---
+
+A kernel that doesn't crash is fine; a kernel that crashes, hangs, or silently produces garbage is what you actually spend time on. This is the runbook. 90% of debugging sessions end once one of the three tools below has pointed at the right line.
+
+## The Three Tools You Use Constantly
+
+### 1. Dump the Generated PTX
+
+The PTX pyptx emits is the authoritative artifact. Call `.ptx()` on the kernel object:
+
+```python
+print(my_kernel.ptx())
+```
+
+The output is human-readable PTX. Check:
+
+- Register declarations match what you expect.
+- Instruction count is what you intended — `for i in range(N)` in Python unrolls to N instructions.
+- Special registers (`%tid.x`, `%ctaid.x`) appear in the right places.
+- SMEM declarations are correct (static vs `dyn_smem`).
+
+Save it to a file for further inspection:
+
+```python
+with open("/tmp/k.ptx", "w") as f:
+    f.write(my_kernel.ptx())
+```
+
+### 2. Validate with ptxas
+
+pyptx's JIT driver swallows line numbers. `ptxas` doesn't:
+
+```bash
+# Validate and print register + SMEM usage:
+/usr/local/cuda-12.8/bin/ptxas -arch=sm_90a -v /tmp/k.ptx -o /dev/null
+```
+
+Output example:
+
+```
+ptxas info    : Compiling entry function 'my_kernel' for 'sm_90a'
+ptxas info    : Function properties for my_kernel
+ptxas info    : Used 84 registers, 2048 bytes smem, ...
+```
+
+High register counts hurt occupancy. Use this to catch unexpected register pressure before profiling.
+
+### 3. Serialize Async Errors
+
+CUDA kernel errors are asynchronous — the error from launch N surfaces on launch N+1. `CUDA_LAUNCH_BLOCKING=1` serializes launches so the error is pinned to the right kernel:
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 python my_script.py
+```
+
+Always do this before reaching for a debugger.
+
+## Common Failure Modes
+
+### `cuLaunchKernel failed with 700` (Illegal Memory Access)
+
+Almost always a bad address, not a bad value.
+
+**Prime suspects:**
+
+<AccordionGroup>
+  <Accordion title="WGMMA descriptor addr_byte_offset wrong for multi-K">
+    For K-major A, stepping K by 16 elements = 32 bytes. For MN-major B with single-stripe layout (`row_bytes ≤ 128`), stepping K by 16 rows = `16 * row_bytes` bytes, **not 32**. Multi-stripe B128 (`row_bytes > 128`, e.g. BN=256 bf16) uses +32 per step because the stripe is laid out K-major internally.
+
+    Verify by sweeping `b_k_offset = kk * X` for `X` in `[32, row_bytes, 16*row_bytes]` and comparing to a reference matmul.
+  </Accordion>
+  <Accordion title="Global-memory offset overflows 32 bits">
+    `row * N_BYTES` with a 32-bit `row` and `N_BYTES` that overflows 32 bits wraps silently. Use `mul.wide.u32` for the multiplication (or let the DSL operator widen it automatically via `px + off_u32`):
+
+    ```python
+    # Bad: overflows at large M*N
+    off_u32 = row * N_bytes   # mul.lo.s32 → stays 32-bit
+
+    # Good: DSL auto-widens u32 to u64 when added to a b64 pointer
+    px += row * N_bytes        # cvt.u64.u32 + add.s64
+    ```
+  </Accordion>
+  <Accordion title="TMA coord out of range">
+    `ptx.cp.async_.bulk.tensor_2d` with a coord exceeding the descriptor's `tensorSize` reads past the end. Double-check that `k_off * BK < K` and `m_base + BM <= M`.
+  </Accordion>
+</AccordionGroup>
+
+### `CUDA_ERROR_INVALID_PTX` with `Unknown symbol 'smem_N'`
+
+The kernel allocated > 48 KB of shared memory, so it switched to dynamic SMEM mode — but some references still use the static symbol names that no longer exist.
+
+**Fix:** declare the SMEM budget explicitly on `@kernel` so dynamic mode is on from the start:
+
+```python
+@kernel(arch="sm_90a", smem=MY_KERNEL_SMEM_BYTES)
+def my_kernel(...):
+    ...
+```
+
+In dynamic mode, `sA.name` resolves to `dyn_smem` (the shared base), not the alloc symbol. If you need to compute a SMEM byte offset manually, add `sA.byte_offset`:
+
+```python
+sA_base = reg.scalar(u32)
+ptx.inst.mov.b32(sA_base, sA.name)         # load dyn_smem base
+if sA.byte_offset > 0:
+    ptx.inst.add.u32(sA_base, sA_base, sA.byte_offset)
+```
+
+### NaN or Garbage Output, No Crash
+
+Run correctness against a trivial reference first (small sizes, simple values like ones). If it passes at small sizes and fails large:
+
+<AccordionGroup>
+  <Accordion title="Fragment layout off (WGMMA epilogue)">
+    Every WGMMA output has a specific `(thread, row, col)` layout. Storing the wrong fragment index to the wrong position gives permuted but non-NaN values. Debug by writing a single fragment element to a known output position and inspecting in Python before writing the full scatter.
+  </Accordion>
+  <Accordion title="Swizzle on write not matching swizzle on read">
+    If you write to SMEM with `apply_swizzle(logical, "32B")` but the consuming WGMMA descriptor uses B128 swizzle, K indices come back permuted. Verify that `smem.wgmma_tile(dtype, shape, major)` on the consumer side picks the same swizzle your writer applied.
+  </Accordion>
+  <Accordion title="Running-state drift in attention kernels">
+    For flash attention, initializing `m_i = -inf` as `0` instead of `-1e30` makes the first `alpha = exp2(m_i_old - m_i_new)` produce garbage. The running `l_i` accumulates the wrong scale for every subsequent block.
+  </Accordion>
+</AccordionGroup>
+
+### Kernel Hangs (Deadlocked Mbarrier)
+
+Usually a deadlocked mbarrier:
+
+- **Arrival count mismatch.** `mbarrier.init(bar, N)` expects N arrives per phase. Issue fewer and `wait` never returns. For warp-specialized kernels, be explicit about which warpgroup is arriving, how many times, and count it on paper before wiring up.
+- **Mixing up `wgmma.wait_group` and `mbarrier.wait`.** `wgmma.wait_group(0)` waits for WGMMA completion; `mbarrier.wait(bar, phase)` waits for a TMA transfer. These are different things. Mixing them up causes infinite waiting.
+- **Missing `ptx.bar.sync(0)` before `mbarrier.wait`.** Some threads rush ahead and try to wait on a barrier that hasn't been programmed by thread 0 yet. Always sync the CTA before each `mbarrier.wait`.
+
+### Launch Overhead ~35 µs Instead of ~14 µs
+
+The C++ Torch extension fell back to the ctypes path because `ninja` isn't installed:
+
+```bash
+pip install ninja
+```
+
+Verify the fast path loaded:
+
+```python
+import pyptx.torch_support as ts
+assert ts._try_load_cpp_ext() is not None
+```
+
+## Inspecting the Generated PTX
+
+```bash
+# Count registers used per kernel (high counts hurt occupancy):
+ptxas -arch=sm_90a -v /tmp/k.ptx -o /dev/null 2>&1 | grep "Used .* registers"
+
+# Extract the instruction mix — spot unintended scalar loops in
+# what should be vectorized code:
+grep -oE '^\s*[a-z]+\.[a-z0-9._]+' /tmp/k.ptx | sort | uniq -c | sort -rn
+```
+
+For a transpiled kernel you're porting, `cuobjdump` extracts PTX from a compiled cubin:
+
+```bash
+cuobjdump -ptx original.cubin > original.ptx
+python -m pyptx.codegen original.ptx --sugar > port.py
+```
+
+## Comparing PTX Before and After a Change
+
+A one-line DSL change should produce a small, local PTX diff:
+
+```bash
+# Save baseline
+python my_kernel.py > /tmp/before.ptx
+
+# Make your change, then:
+python my_kernel.py > /tmp/after.ptx
+diff /tmp/before.ptx /tmp/after.ptx
+```
+
+If a one-line change produces a large diff, you likely changed something you didn't mean to — a trace-time branch that diverged, a different register allocation path, or an unrolled loop that changed count.
+
+## The ptx.raw Escape Hatch
+
+For instructions not yet modeled in the DSL, `ptx.raw` injects a raw PTX string directly into the trace:
+
+```python
+# Emit a raw PTX instruction not covered by ptx.inst.*
+ptx.raw("membar.gl;")
+```
+
+Use sparingly. Raw strings aren't validated at trace time — errors surface only at `ptxas` time or launch time.
+
+## When In Doubt
+
+<Steps>
+  <Step title="Run at the smallest shape that exercises the feature">
+    A broken kernel usually fails at any size. A layout bug often fails only past some threshold. Start at B=1, M=64, N=64.
+  </Step>
+  <Step title="Compare PTX before and after">
+    `diff before.ptx after.ptx`. A one-line DSL edit = a small, local PTX diff. If the diff is large, you changed something unintended.
+  </Step>
+  <Step title="Use CUDA_LAUNCH_BLOCKING before a debugger">
+    Async errors come from the *previous* launch. Blocking pins them to the right kernel.
+  </Step>
+  <Step title="Validate with ptxas">
+    `ptxas -arch=sm_90a -v /tmp/k.ptx -o /dev/null`. Catches structural PTX errors with line numbers. Run this before launching on hardware.
+  </Step>
+</Steps>
+
+## What To Read Next
+
+<CardGroup cols={2}>
+  <Card title="Mbarriers and Async Sync" href="/guides/mbarriers">
+    Detailed mbarrier correctness checklist — the most common deadlock source.
+  </Card>
+  <Card title="Tiles, Layouts, and TMA" href="/guides/tiles-layouts-tma">
+    Swizzle matching rules that cause silent wrong output.
+  </Card>
+  <Card title="Hopper GEMM" href="/guides/handwritten-gemm">
+    Fragment layout reference for diagnosing epilogue permutation bugs.
+  </Card>
+  <Card title="First Kernel" href="/guides/first-kernel">
+    Back to basics — the smallest kernel that exercises print(kernel.ptx()).
+  </Card>
+</CardGroup>

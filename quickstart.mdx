@@ -1,81 +1,163 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
-icon: 'rocket'
+title: "Quickstart: write and run your first PTX kernel"
+description: "Define a pyptx kernel with @kernel, allocate registers with reg.scalar, emit instructions with ptx.inst, inspect the PTX string, and launch from PyTorch or JAX."
 ---
 
-## Get started in three steps
+This page walks you through the complete pyptx workflow: define a kernel, inspect the PTX it produces, then launch it from PyTorch or JAX. The whole thing takes under five minutes. If you haven't installed pyptx yet, start with [installation](/installation).
 
-Get your documentation site running locally and make your first customization.
+<Steps>
+  <Step title="Install pyptx">
+    Install the base package plus whichever runtime you want to use for launching:
 
-### Step 1: Set up your local environment
+    <CodeGroup>
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```bash PyTorch
+    pip install ninja 'pyptx[torch]'
+    ```
 
-### Step 2: Deploy your changes
+    ```bash JAX
+    pip install 'pyptx[jax]'
+    ```
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    ```bash Both
+    pip install ninja 'pyptx[all]'
+    ```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    </CodeGroup>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    The `ninja` package is optional but recommended for the PyTorch path — it cuts dispatch overhead from ~34 µs to ~14 µs on first launch.
+  </Step>
 
-### Step 3: Go live
+  <Step title="Define a kernel">
+    A `@kernel`-decorated function runs at trace time on the host CPU, emitting PTX instructions as it goes. Every `ptx.*` call records exactly one PTX instruction.
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    ```python
+    from pyptx import kernel, reg, ptx
+    from pyptx.types import f32, u32
+
+    @kernel(arch="sm_90a")
+    def tiny():
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        x = reg.scalar(f32, init=0.0)
+        ptx.inst.cvt.rn.f32.u32(x, tid)
+        ptx.ret()
+    ```
+
+    Key points:
+
+    - `arch="sm_90a"` targets Hopper; use `"sm_100a"` for Blackwell
+    - `reg.scalar(u32)` allocates a PTX register — it runs in Python, not on the GPU
+    - `ptx.inst.mov.u32(tid, ptx.special.tid.x())` emits a single `mov.u32` instruction
+    - `reg.scalar(f32, init=0.0)` encodes the Python float to PTX's `0f00000000` hex form automatically
+    - `ptx.ret()` closes the kernel body
+  </Step>
+
+  <Step title="Inspect the PTX">
+    Call `.ptx()` on the kernel object before running anything. This is the actual PTX that will be handed to the driver — no hidden transformations.
+
+    ```python
+    print(tiny.ptx())
+    ```
+
+    Output:
+
+    ```ptx
+    .version 8.0
+    .target sm_90a
+    .address_size 64
+
+    .visible .entry tiny(
+    )
+    {
+        .reg .u32 %r<2>;
+        .reg .f32 %f<1>;
+
+        mov.u32 %r0, %tid.x;
+        cvt.rn.f32.u32 %f0, %r0;
+        ret;
+    }
+    ```
+
+    What you write in Python maps directly to what appears here. There is no register renaming, no instruction reordering, and no fusion.
+  </Step>
+
+  <Step title="Launch from PyTorch">
+    With `pyptx[torch]` installed, the kernel object works as a standard callable. Pass CUDA tensors directly:
+
+    ```python
+    from examples.hopper.rms_norm import build_rms_norm
+    import torch
+
+    k = build_rms_norm(4, 64)
+
+    x = torch.randn(4, 64, device="cuda") * 0.3
+    w = torch.randn(64, device="cuda") * 0.1 + 1.0
+    out = k(x, w)
+    ```
+
+    You can also pass it to `torch.compile` without changing the kernel at all:
+
+    ```python
+    @torch.compile
+    def compiled_rms(x, w):
+        return k(x, w)
+
+    out = compiled_rms(x, w)
+    ```
+
+    <Tip>
+      On the first call, pyptx JIT-compiles the PTX through `cuModuleLoadData` and (if `ninja` is installed) builds the C++ dispatch extension. Subsequent calls reuse the compiled module from the cache.
+    </Tip>
+  </Step>
+
+  <Step title="Launch from JAX">
+    With `pyptx[jax]` installed, the kernel registers as a typed FFI handler and runs inside `jax.jit` with no code changes:
+
+    ```python
+    import jax
+    import jax.numpy as jnp
+    from examples.hopper.rms_norm import build_rms_norm
+
+    k = build_rms_norm(4, 64)
+
+    x = jnp.array([[...]], dtype=jnp.float32)  # shape (4, 64)
+    w = jnp.ones(64, dtype=jnp.float32)
+
+    @jax.jit
+    def run(x, w):
+        return k(x, w)
+
+    out = run(x, w)
+    ```
+
+    The kernel object is the same object you would call from PyTorch. pyptx dispatches to the right runtime path automatically based on which framework's arrays are passed in.
+  </Step>
+</Steps>
+
+## Using the transpiler
+
+If you have existing PTX — from `nvcc`, Triton, Pallas, or cuBLAS — you can convert it to editable pyptx Python in one command:
+
+```bash
+python -m pyptx.codegen kernel.ptx --sugar --name my_kernel > my_kernel.py
+```
+
+The `--sugar` flag collapses spin-loops into `ptx.loop(...)`, demangles register names, and groups expression chains. The round-trip is byte-identical on 218+ corpus files.
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
-<CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+<Columns cols={2}>
+  <Card title="First kernel" icon="pen-to-square" href="/guides/first-kernel">
+    The complete authoring pattern: specs, registers, shared memory, and control flow
+  </Card>
+  <Card title="RMS norm walkthrough" icon="function" href="/guides/rms-norm">
+    A full RMS normalization kernel with v4 loads and warp butterfly reduce
+  </Card>
+  <Card title="JAX runtime" icon="bolt" href="/runtimes/jax">
+    How pyptx kernels integrate with jax.jit via typed FFI
+  </Card>
+  <Card title="PyTorch runtime" icon="bolt" href="/runtimes/torch">
+    Eager dispatch, torch.compile, and CUDA graph replay
+  </Card>
+</Columns>

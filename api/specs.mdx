@@ -1,0 +1,242 @@
+---
+title: "Tile and Layout — tensor boundary specs"
+description: "Reference for pyptx.specs: the Tile and Layout classes that describe tensor shape, dtype, and memory layout for @kernel in_specs and out_specs."
+---
+
+`Tile` and `Layout` describe the contract between the Python runtime and the traced PTX kernel body. They appear in the `in_specs` and `out_specs` arguments of the `@kernel` decorator and tell the runtime how to resolve symbolic dimension names, validate input shapes, and synthesize TMA descriptors.
+
+```python
+from pyptx import Tile, Layout, kernel
+from pyptx.types import bf16, f32
+
+@kernel(
+    in_specs=(
+        Tile("M", "K", bf16, Layout.ROW),
+        Tile("K", "N", bf16, Layout.COL),
+    ),
+    out_specs=(Tile("M", "N", f32, Layout.ROW),),
+    grid=lambda M, N, K: (M // 128, N // 256),
+    block=(128, 1, 1),
+    arch="sm_90a",
+)
+def gemm(A, B, C): ...
+```
+
+---
+
+## `Tile`
+
+A frozen dataclass representing a tensor spec: shape + dtype + layout. Shape dimensions can be concrete integers or symbolic strings that get bound to real integers at call time.
+
+### Constructor
+
+```python
+Tile(*dims_and_dtype, dtype=None, layout=Layout.ROW,
+     tma_box=None, tma_rank=2, tma_padding=False)
+```
+
+Positional arguments are parsed left-to-right: strings and ints become shape dimensions, a `PtxType` becomes the dtype, and a `Layout` becomes the layout. Keyword forms (`dtype=`, `layout=`) may be used instead or in addition.
+
+```python
+# Both are equivalent:
+Tile("M", "K", bf16, Layout.ROW)
+Tile("M", "K", dtype=bf16, layout=Layout.ROW)
+```
+
+### Parameters
+
+<ParamField path="dims" type="str | int (variadic)" required>
+  Shape dimensions in order. A string like `"M"` is a symbolic variable resolved at call time from the input array's actual shape. An int is a concrete, fixed dimension validated at call time.
+</ParamField>
+
+<ParamField path="dtype" type="PtxType" required>
+  Element type, e.g. `bf16`, `f32`, `u32`.
+</ParamField>
+
+<ParamField path="layout" type="Layout" default="Layout.ROW">
+  Memory layout. `Layout.ROW` for row-major (C order), `Layout.COL` for column-major. Use `Layout.TMA_128B` / `TMA_64B` / `TMA_32B` for TMA-loaded operands with swizzle.
+</ParamField>
+
+<ParamField path="tma_box" type="tuple[Dim, ...] | None" default="None">
+  Per-TMA-load box shape. When set, each `cp.async.bulk.tensor` call loads a slice of this shape rather than the whole tensor. K-loop kernels set this implicitly via `Tile.wgmma_a(tile_k=...)`.
+</ParamField>
+
+<ParamField path="tma_rank" type="int" default="2">
+  TMA descriptor rank. `2` for standard descriptors, `3` for the Hopper reshaped rank-3 encoding used by high-performance GEMM kernels.
+</ParamField>
+
+<ParamField path="tma_padding" type="bool" default="False">
+  Request the padded innermost store box for `tma_rank=3`. Used by Hopper GEMM epilogue patterns.
+</ParamField>
+
+### Properties
+
+<ResponseField name="shape" type="tuple[Dim, ...]">
+  Shape tuple as provided. May contain strings (symbolic) and/or ints (concrete).
+</ResponseField>
+
+<ResponseField name="dtype" type="PtxType">
+  Element type.
+</ResponseField>
+
+<ResponseField name="layout" type="Layout">
+  Memory layout.
+</ResponseField>
+
+<ResponseField name="rank" type="int">
+  Number of dimensions.
+</ResponseField>
+
+<ResponseField name="symbolic_dims" type="tuple[str, ...]">
+  The symbolic dimension names in declaration order. For `Tile("M", "K", bf16)` this is `("M", "K")`.
+</ResponseField>
+
+### Methods
+
+#### `.resolve_shape(env) → tuple[int, ...]`
+
+Resolve all symbolic dims using a `{name: int}` environment. Raises `KeyError` if a symbolic dim is not in `env`.
+
+```python
+tile = Tile("M", "K", bf16)
+concrete = tile.resolve_shape({"M": 4096, "K": 64})
+# → (4096, 64)
+```
+
+#### `.extract_env(array_shape) → dict[str, int]`
+
+Extract the `{dim_name: int}` mapping from a concrete array shape. Validates concrete dims and raises `ValueError` on mismatches.
+
+```python
+tile = Tile("M", "K", bf16)
+env = tile.extract_env((4096, 64))
+# → {"M": 4096, "K": 64}
+```
+
+#### `.matches(array_shape, array_dtype_name) → bool`
+
+Return `True` if the array's rank and concrete dims match this tile. Does not validate symbolic dims (use `extract_env` for that).
+
+---
+
+## WGMMA shortcut constructors
+
+These class methods create `Tile` objects with the correct TMA layout and box shape for Hopper WGMMA operands.
+
+### `Tile.wgmma_a(m, k, dtype, *, tile_m=None, tile_k=None) → Tile`
+
+Tile for a WGMMA A operand (K-major, row-major MxK). Automatically picks `Layout.TMA_*B` from the per-TMA-load K width.
+
+<ParamField path="m" type="Dim" required>
+  M dimension of the full tensor.
+</ParamField>
+
+<ParamField path="k" type="Dim" required>
+  K dimension of the full tensor.
+</ParamField>
+
+<ParamField path="dtype" type="PtxType" required>
+  Element type.
+</ParamField>
+
+<ParamField path="tile_k" type="Dim | None" default="None">
+  K slice loaded per TMA call. When set, the TMA box is `(tile_m or m, tile_k)` and the matching `smem.wgmma_tile(dtype, (tile_m, tile_k), major="K")` should match.
+</ParamField>
+
+<ParamField path="tile_m" type="Dim | None" default="None">
+  M slice loaded per TMA call. Use with multi-CTA kernels where each CTA loads a narrower M slice.
+</ParamField>
+
+```python
+# Whole-K load (single TMA, single WGMMA step)
+Tile.wgmma_a(64, 16, bf16)
+
+# K=16 slices of K=64 tensor (four TMA loads, four WGMMA)
+Tile.wgmma_a(64, 64, bf16, tile_k=16)
+
+# Multi-CTA: 2048xK tensor, each CTA loads a 64xK slice
+Tile.wgmma_a(2048, 64, bf16, tile_m=64, tile_k=16)
+```
+
+### `Tile.wgmma_b(k, n, dtype, *, tile_k=None, tile_n=None) → Tile`
+
+Tile for a WGMMA B operand (MN-major). Same semantics as `wgmma_a`. The TMA box is `(tile_k or k, tile_n or n)`.
+
+```python
+Tile.wgmma_b(64, 256, bf16, tile_k=16)
+```
+
+---
+
+## `Layout` enum
+
+Memory layout for a tile. Used in `Tile` and in `smem.wgmma_tile` / TMA descriptor synthesis.
+
+| Value | String | Meaning |
+|---|---|---|
+| `Layout.ROW` | `"row"` | Row-major (C order) |
+| `Layout.COL` | `"col"` | Column-major (Fortran order) |
+| `Layout.TMA_128B` | `"tma_128b"` | TMA 128-byte swizzle (Hopper) |
+| `Layout.TMA_64B` | `"tma_64b"` | TMA 64-byte swizzle |
+| `Layout.TMA_32B` | `"tma_32b"` | TMA 32-byte swizzle |
+| `Layout.INTERLEAVED` | `"interleaved"` | CUTLASS interleaved layout |
+
+The `TMA_*B` variants tell the runtime to use a swizzled TMA descriptor when `tensor.tma_desc()` is called inside the kernel body.
+
+---
+
+## How symbolic dims flow at runtime
+
+When you call a kernel with concrete JAX or PyTorch arrays, pyptx:
+
+1. Iterates over `in_specs` and calls `spec.extract_env(array.shape)` for each input.
+2. Merges all `{dim: int}` environments with `unify_envs`, which raises `ValueError` on conflicting values for the same dim name.
+3. Passes the merged environment to the grid lambda, the trace, and the TMA descriptor synthesizer.
+
+```python
+# in_specs has Tile("M","K",bf16) and Tile("K","N",bf16)
+# Calling with shapes (4096, 64) and (64, 256):
+# → env = {"M": 4096, "K": 64, "N": 256}
+# → grid(M=4096, N=256, K=64) → (32, 1)
+```
+
+---
+
+## Complete example
+
+```python
+from pyptx import kernel, reg, smem, ptx, Tile, Layout
+from pyptx.types import bf16, f32, u32
+
+@kernel(
+    in_specs=(
+        Tile.wgmma_a("M", "K", bf16, tile_k="BK"),
+        Tile.wgmma_b("K", "N", bf16, tile_k="BK"),
+    ),
+    out_specs=(Tile("M", "N", f32, Layout.ROW),),
+    grid=lambda M, N, K: (M // 64, N // 256),
+    block=(128, 1, 1),
+    arch="sm_90a",
+)
+def gemm(A, B, C, *, BM=64, BN=256, BK=64):
+    ...
+
+# Inspect the PTX for a concrete shape
+print(gemm.ptx(M=4096, N=4096, K=4096))
+```
+
+---
+
+## `unify_envs(envs) → dict[str, int]`
+
+Merge multiple `{dim: int}` environments. Raises `ValueError` if the same dim name maps to different values in different inputs.
+
+```python
+from pyptx.specs import unify_envs
+
+env = unify_envs([
+    {"M": 4096, "K": 64},
+    {"K": 64,   "N": 256},
+])
+# → {"M": 4096, "K": 64, "N": 256}
+```

@@ -1,0 +1,277 @@
+---
+title: "reg — register allocation and arithmetic DSL"
+description: "Reference for pyptx.reg: allocating PTX registers, the Reg and RegArray objects, operator overloads that emit PTX arithmetic, and predicate helpers."
+---
+
+The `reg` module turns Python values into explicit PTX registers. It is the first thing you reach for inside a `@kernel` body — allocate registers, load special values into them, then use Python arithmetic operators to emit PTX instructions.
+
+```python
+from pyptx import reg, ptx
+from pyptx.types import f32, u32, pred
+
+tid  = reg.from_(ptx.special.tid.x(), u32)
+acc  = reg.array(f32, 64)
+p    = reg.scalar(pred)
+lane = tid & 31          # emits: and.b32 %r1, %r0, 31
+done = lane == 0         # emits: setp.eq.u32 %p0, %r1, 0
+```
+
+This module covers exactly the patterns that appear dozens of times in handwritten PTX kernels: pointer math, integer loop state, predicates, and accumulator arrays. Float arithmetic that requires explicit rounding modifiers still goes through `ptx.inst.*`.
+
+---
+
+## Allocation functions
+
+### `reg.scalar(dtype, init=None, name=None) → Reg`
+
+Allocate a single register, optionally initialized.
+
+Emits `.reg .{dtype} %name;`. If `init` is given, also emits `mov.{dtype} %name, init;`.
+
+<ParamField path="dtype" type="PtxType" required>
+  The PTX type for the register, e.g. `f32`, `u64`, `pred`.
+</ParamField>
+
+<ParamField path="init" type="int | float | None" default="None">
+  Optional initial value. Floats are encoded as PTX hex literals (`0fXXXXXXXX` for f32, `0dXXXX...` for f64). Only f32 and f64 support float literals directly; for f16/bf16 use `b16` + a conversion.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Override the auto-generated register name. Useful when round-tripping PTX from a corpus.
+</ParamField>
+
+```python
+loop_ctr = reg.scalar(u32, init=0)    # .reg .u32 %r0; mov.u32 %r0, 0;
+phase    = reg.scalar(u32, init=1)
+acc0     = reg.scalar(f32, init=0.0)  # encoded as 0f00000000
+p        = reg.scalar(pred)
+```
+
+---
+
+### `reg.array(dtype, count, name=None) → RegArray`
+
+Allocate an array of registers. Emits `.reg .{dtype} %prefix<count>;`.
+
+<ParamField path="dtype" type="PtxType" required>
+  Element type for all registers in the array.
+</ParamField>
+
+<ParamField path="count" type="int" required>
+  Number of registers to declare.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Explicit base name. When `None` (the default), a prefix is chosen automatically from the dtype and a per-kernel counter.
+</ParamField>
+
+```python
+acc   = reg.array(f32, 64)    # .reg .f32 %f<64>;
+tiles = reg.array(b32, 16)
+```
+
+---
+
+### `reg.from_(src, dtype) → Reg`
+
+Allocate a register and emit a single `mov` from `src`. The canonical prologue pattern for loading special registers and symbolic addresses.
+
+<ParamField path="src" type="Reg | str" required>
+  Source value. A `Reg` is used directly; a `str` is treated as a symbolic label (e.g. `"smem"`, `"%laneid"`).
+</ParamField>
+
+<ParamField path="dtype" type="PtxType" required>
+  Type of the destination register.
+</ParamField>
+
+```python
+tid       = reg.from_(ptx.special.tid.x(), u32)
+smem_base = reg.from_("smem", u32)
+```
+
+---
+
+### Predicate registers
+
+Allocate a predicate register with `reg.scalar(pred)`:
+
+```python
+from pyptx.types import pred as pred_type
+p = reg.scalar(pred_type)
+```
+
+There is no standalone `reg.pred()` function — `reg.scalar(pred)` is the canonical form.
+
+---
+
+### `reg.wgmma_frag(*, m, n, dtype, name=None) → RegArray`
+
+Allocate an accumulator fragment for a dense Hopper WGMMA operation. The fragment size is `m * n // 128` registers.
+
+<ParamField path="m" type="int" required>
+  M dimension of the WGMMA tile.
+</ParamField>
+
+<ParamField path="n" type="int" required>
+  N dimension of the WGMMA tile.
+</ParamField>
+
+<ParamField path="dtype" type="PtxType" required>
+  Accumulator element type (typically `f32`).
+</ParamField>
+
+```python
+acc = reg.wgmma_frag(m=64, n=256, dtype=f32)
+# → .reg .f32 %f<128>;  (64*256/128 = 128 registers)
+```
+
+---
+
+### `reg.alloc(dtype) → Reg` and `reg.alloc_array(dtype, count) → RegArray`
+
+Auto-named alternatives to `reg.scalar` / `reg.array`. The DSL picks a unique name from a per-type counter using a distinct prefix so auto names never collide with manual ones.
+
+```python
+a0 = reg.alloc(f32)         # %af0
+a1 = reg.alloc(f32)         # %af1
+arr = reg.alloc_array(f32, 32)
+```
+
+---
+
+## `Reg` object
+
+A symbolic reference to a single PTX register. Holds a `name` (e.g. `"%f0"`) and a `dtype`.
+
+<ResponseField name="name" type="str">
+  PTX register name, e.g. `"%r0"`, `"%fd2"`, `"%p0"`.
+</ResponseField>
+
+<ResponseField name="dtype" type="PtxType">
+  Element type of this register.
+</ResponseField>
+
+### Arithmetic operators
+
+Operator overloads emit PTX instructions and return new `Reg` objects. They are intentionally limited to integer and pointer types — use `ptx.inst.*` for float arithmetic where explicit rounding matters.
+
+| Operator | PTX emitted | Notes |
+|---|---|---|
+| `a + b` | `add.s64` / `add.u32` | 64-bit left: `add.s64`; 32-bit: `add.u32` |
+| `a += b` | in-place `add` | writes directly to `a.name` |
+| `a - b` | `sub.s64` / `sub.s32` | |
+| `a -= b` | in-place `sub` | |
+| `a * b` | `mul.lo.u32` / `mul.lo.u64` | `u32 * int` → `mul.lo.s32` keeping 32-bit result |
+| `a *= b` | in-place `mul.lo` | |
+| `a << n` | `shl.b32` / `shl.b64` | |
+| `a >>  n` | `shr.u32` / `shr.u64` | |
+| `a & b` | `and.b32` / `and.b64` | |
+| `a ^ b` | `xor.b32` / `xor.b64` | |
+| `a.max(b)` | `max.u32` / `max.s32` | 32-bit only |
+
+### Comparison operators (emit `setp`, return pred `Reg`)
+
+```python
+p = (tid < 128)     # setp.lt.u32 %p0, %r0, 128
+p = (a == b)        # setp.eq.u32 %p1, %r0, %r1
+p = (x != 0)        # setp.ne.u32 %p2, %r0, 0
+```
+
+### Predicate negation
+
+```python
+~p   # returns NegPred — use in ptx.if_(~p) or as @!p predicate
+```
+
+### Pointer arithmetic example
+
+```python
+from pyptx.types import b64, u64, u32
+
+base = reg.scalar(b64)
+ptx.inst.ld.param.u64(base, ptx.addr(A))
+ptx.inst.cvta.to.global_.u64(base, base)
+
+tid  = reg.from_(ptx.special.tid.x(), u32)
+off  = tid * 4                 # mul.lo.s32 → u32
+ptr  = base + off              # cvt.u64.u32 + add.s64 → u64
+```
+
+---
+
+## `RegArray` object
+
+An array of registers declared with `.reg .type %name<count>`.
+
+<ResponseField name="count" type="int">
+  Number of registers in the array.
+</ResponseField>
+
+<ResponseField name="base" type="str">
+  Base register name, e.g. `"%f"` or `"%farr0_"`.
+</ResponseField>
+
+<ResponseField name="dtype" type="PtxType">
+  Element type of every register in the array.
+</ResponseField>
+
+**Indexing** returns a `Reg`:
+
+```python
+acc[0]        # Reg("%f0", f32)
+acc[63]       # Reg("%f63", f32)
+```
+
+**Assignment** retargets the last emitted instruction's destination, avoiding a redundant `mov`:
+
+```python
+acc[5] = (acc[4] + offset)   # renames last instruction's dst to %f5
+```
+
+**Iteration:**
+
+```python
+for r in acc:
+    ptx.inst.mov.f32(r, 0.0)
+
+regs = acc.regs()         # Python list of Reg
+hw   = acc.hw_order(reverse=True)  # reversed order for Hopper WGMMA
+```
+
+---
+
+## `NegPred` and `PipeRef`
+
+<ResponseField name="NegPred" type="class">
+  Produced by `~p`. Represents `@!p` in branch predicates. Use in `ptx.if_(~p)` or as the `pred` argument to any `ptx.inst.*` call.
+</ResponseField>
+
+<ResponseField name="PipeRef" type="class">
+  Produced by `p | q` when either operand is a predicate register. Represents the `%p0|%p1` dual-predicate output operand used by `setp` variants.
+</ResponseField>
+
+---
+
+## Complete example
+
+```python
+from pyptx import kernel, reg, ptx
+from pyptx.types import f32, u32, b64, pred as pred_type
+
+@kernel(arch="sm_90a", block=(128, 1, 1))
+def saxpy(X, Y, *, alpha=1.0):
+    # Load parameter pointers
+    px, py = ptx.global_ptrs(X, Y)
+
+    # Compute per-thread byte offset: tid * 4 bytes
+    tid = reg.from_(ptx.special.tid.x(), u32)
+    off = tid * 4            # mul.lo.s32 → u32
+
+    # Load, scale, store
+    src = reg.scalar(f32)
+    dst = reg.scalar(f32)
+    ptx.inst.ld.global.f32(src, ptx.addr(px + off))
+    ptx.inst.mul.rn.f32(dst, src, alpha)
+    ptx.inst.st.global.f32(ptx.addr(py + off), dst)
+    ptx.ret()
+```

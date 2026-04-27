@@ -1,0 +1,197 @@
+---
+title: 'Running pyptx Kernels with JAX and jax.jit'
+description: 'Learn how to launch handwritten PTX kernels from JAX using the typed FFI path, including installation, shape binding, and the XLA-free cuModuleLoadData launch flow.'
+---
+
+pyptx's JAX integration lets you call a handwritten PTX kernel from inside `@jax.jit` as if it were any other JAX function. The kernel body is real PTX-oriented code; JAX is only the runtime boundary — not the code-generation layer.
+
+## Installation
+
+<Steps>
+  <Step title="Install JAX with CUDA support">
+    Install the JAX extras group, which pulls in `jax[cuda12]>=0.4.20` and `cuda-python>=12.3`.
+
+    ```bash
+    pip install 'pyptx[jax]'
+    ```
+
+    <Note>
+      `cuda-python>=12.3` is required for the `cuda.bindings.driver` API used to JIT-compile PTX via `cuModuleLoadData`.
+    </Note>
+  </Step>
+  <Step title="Verify the C++ shim is available">
+    The launch shim (`libpyptx_shim.so`) ships with prebuilt wheels. If you are building from source, run the build script once:
+
+    ```bash
+    pyptx/_shim/build.sh
+    ```
+  </Step>
+</Steps>
+
+## Complete example
+
+The example below defines an RMS-norm kernel, wraps it in `@jax.jit`, and calls it with `jnp` arrays. The kernel is authored with `reg`, `ptx.inst`, and `ptx.warp` — it never passes through XLA codegen.
+
+```python
+import jax
+import jax.numpy as jnp
+
+from pyptx import Tile, kernel, ptx, reg
+from pyptx.types import f32, u32
+
+WARP_SIZE = 32
+
+
+def build_rms_norm(B: int, N: int, eps: float = 1e-6):
+    items_per_thread = N // WARP_SIZE
+
+    @kernel(
+        in_specs=(Tile(B, N, f32), Tile(N, f32)),
+        out_specs=(Tile(B, N, f32),),
+        grid=(B, 1, 1),
+        block=(WARP_SIZE, 1, 1),
+        arch="sm_90a",
+    )
+    def rms_norm(X, W, Y):
+        px, pw, py = ptx.global_ptrs(X, W, Y)
+
+        row = reg.from_(ptx.special.ctaid.x(), u32)
+        row_byte_off = row * (N * 4)
+        px += row_byte_off
+        py += row_byte_off
+
+        tid = reg.from_(ptx.special.tid.x(), u32)
+        sum_sq = reg.scalar(f32, init=0.0)
+        x_vals = reg.array(f32, items_per_thread)
+
+        for i in range(items_per_thread):
+            idx = tid + i * WARP_SIZE
+            ptr = px + idx * 4
+            ptx.inst.ld.global_.f32(x_vals[i], ptx.addr(ptr))
+            ptx.inst.fma.rn.f32(sum_sq, x_vals[i], x_vals[i], sum_sq)
+
+        ptx.warp.reduce_sum(sum_sq)
+
+        mean_sq = reg.scalar(f32)
+        inv_n = reg.scalar(f32, init=1.0 / N)
+        eps_reg = reg.scalar(f32, init=eps)
+        rstd = reg.scalar(f32)
+        ptx.inst.mul.f32(mean_sq, sum_sq, inv_n)
+        ptx.inst.add.f32(mean_sq, mean_sq, eps_reg)
+        ptx.inst.rsqrt.approx.f32(rstd, mean_sq)
+
+        for i in range(items_per_thread):
+            idx = tid + i * WARP_SIZE
+            off = idx * 4
+            w_val = reg.scalar(f32)
+            y_val = reg.scalar(f32)
+            ptx.inst.ld.global_.f32(w_val, ptx.addr(pw + off))
+            ptx.inst.mul.f32(y_val, x_vals[i], rstd)
+            ptx.inst.mul.f32(y_val, y_val, w_val)
+            ptx.inst.st.global_.f32(ptx.addr(py + off), y_val)
+        ptx.ret()
+
+    return rms_norm
+
+
+k = build_rms_norm(16, 512)
+
+@jax.jit
+def fn(x, w):
+    return k(x, w)
+
+
+x = jnp.ones((16, 512), dtype=jnp.float32)
+w = jnp.ones((512,), dtype=jnp.float32)
+out = fn(x, w)
+```
+
+The `Tile` specs on `in_specs` and `out_specs` declare the expected shapes. When `fn` is called with `jnp` arrays of shape `(16, 512)` and `(512,)`, those concrete dimensions are bound to the symbolic slots inside the `Tile` descriptors — no shape parameters need to be passed explicitly at call time.
+
+## How shapes are bound
+
+Every `Tile` carries symbolic dimension names (or concrete integers). When `Kernel.__call__` receives JAX arrays, it calls `spec.extract_env(arr.shape)` for each input, producing a `shape_env` dictionary mapping symbol names to concrete integer values. All symbolic dims in `out_specs` are then resolved against the same `shape_env` to allocate output `ShapeDtypeStruct` objects.
+
+```python
+# Tile(B, N, f32) with a (16, 512) array resolves to {B: 16, N: 512}
+# Tile(N, f32) with a (512,) array merges in {N: 512}
+# out_specs=(Tile(B, N, f32),) resolves to shape (16, 512)
+```
+
+If two input specs disagree on the value of the same symbol, `unify_envs` raises a `ValueError` immediately, before any PTX is emitted.
+
+## The typed FFI mechanism
+
+pyptx uses JAX's typed FFI API (`jax.ffi.ffi_call` with `api_version=1`) to dispatch to the C++ shim. The shim's `PyptxLaunch` symbol is wrapped in a `PyCapsule` and registered with JAX once per process via `jax.ffi.register_ffi_target`.
+
+At `jax.jit` trace time, `call_kernel_via_ffi` in `jax_support.py` emits an `ffi_call` node that carries only the `cubin_handle` integer attribute — everything else (grid, block, shared memory bytes, `CUfunction` pointer) is already registered in the shim's per-handle registry. When XLA dispatches the custom call at runtime it calls `PyptxLaunch`, which looks up the handle, calls `cuLaunchKernel`, and returns.
+
+```python
+# Simplified view of what call_kernel_via_ffi builds:
+call_fn = jax.ffi.ffi_call(
+    "pyptx_launch",
+    result_shape_dtypes,       # ShapeDtypeStruct per out_spec
+    has_side_effect=False,
+)
+return call_fn(*inputs, cubin_handle=np.int64(handle))
+```
+
+<Note>
+  The FFI target is registered lazily. On machines without the C++ shim (laptops without a CUDA driver), registration is skipped and `jit().lower()` still works for PTX inspection — only the actual GPU launch fails.
+</Note>
+
+## XLA-free PTX loading
+
+PTX never passes through XLA's code-generation pipeline. The compilation flow is:
+
+1. `Kernel.__call__` traces the Python body to a PTX `Module` IR.
+2. `emit(module)` serializes that IR to a PTX source string.
+3. `compile_ptx_to_cubin` calls `driver.cuModuleLoadData` (cuda-python) on the PTX bytes. If the driver's JIT rejects the PTX version it falls back to offline `ptxas`.
+4. The resulting `CUfunction` pointer is registered in the shim's launch table under a process-local integer handle.
+5. The handle is passed as a scalar attribute to `jax.ffi.ffi_call`. XLA stores it in the compiled program but never inspects PTX.
+
+This means CUDA graph capture, multi-device replication, and all other XLA scheduling features continue to work around the kernel without any special handling.
+
+## Launch overhead
+
+The C++ shim adds approximately **~14 µs** of Python-to-CUDA dispatch overhead per kernel call. This covers the `cuLaunchKernel` call and the shim's per-handle registry lookup. There is no additional overhead from JAX tracing on cached shapes — the `ffi_call` node is compiled into the XLA executable and replayed with near-zero Python involvement.
+
+<Tip>
+  For repeated calls with the same input shapes inside a `jax.jit`-compiled function, JAX's compilation cache ensures the PTX is never re-traced and the shim handle is never re-registered.
+</Tip>
+
+## Differentiable kernels with `jax.grad`
+
+If you need gradients, pair your forward kernel with a backward kernel and use pyptx's `differentiable_kernel` helper. The result is compatible with `jax.grad` and `jax.jit`:
+
+```python
+from pyptx import differentiable_kernel
+
+fwd = build_rms_norm_fwd(B, N)
+bwd = build_rms_norm_bwd(B, N)
+
+rms_norm_diff = differentiable_kernel(
+    fwd, bwd,
+    save_for_backward=[0, 1],  # save input indices 0 and 1
+)
+
+@jax.jit
+def loss_fn(x, w):
+    y = rms_norm_diff(x, w)
+    return y.sum()
+
+grad_fn = jax.grad(loss_fn, argnums=(0, 1))
+dx, dw = grad_fn(x, w)
+```
+
+<Warning>
+  The JAX path does not automatically generate a backward kernel. You must provide one explicitly via `differentiable_kernel`. pyptx does not differentiate through PTX instructions.
+</Warning>
+
+## Good first examples
+
+The best places to read real pyptx JAX kernels after this page:
+
+- `examples/hopper/rms_norm.py` — the kernel from this page, with both JAX and Torch call sites
+- `examples/hopper/layer_norm.py` — a layer-norm variant showing the same pattern
+- `examples/hopper/experimental/` — flash attention experiments that stress-test the TMA and wgmma paths

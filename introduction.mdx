@@ -1,0 +1,80 @@
+---
+title: "pyptx: Python DSL for Hopper and Blackwell PTX"
+description: "pyptx lets you write NVIDIA PTX kernels in Python with one call per instruction, targeting Hopper (sm_90a) and Blackwell (sm_100a) GPUs, callable from JAX and PyTorch."
+---
+
+pyptx is a Python DSL for handwriting PTX kernels that target NVIDIA Hopper (sm\_90a) and Blackwell (sm\_100a) GPUs. Every `ptx.*` call emits exactly one PTX instruction — there is no optimizer, no tensor IR, and no scheduler between the Python you write and the assembly it produces. The result is PTX you can read, diff, and ship.
+
+<Columns cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install pyptx with optional PyTorch or JAX runtime support
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Write, inspect, and run your first kernel in under five minutes
+  </Card>
+  <Card title="Guides" icon="book-open" href="/guides/first-kernel">
+    Walkthroughs for real kernels: RMS norm, WGMMA GEMM, Blackwell tcgen05
+  </Card>
+  <Card title="API reference" icon="code" href="/api/kernel">
+    Complete reference for `kernel`, `ptx`, `reg`, `smem`, and `types`
+  </Card>
+</Columns>
+
+## What pyptx is
+
+pyptx is a **one-call-one-instruction PTX DSL**. A `@kernel`-decorated Python function is a trace-time program: it runs once in Python to produce a PTX string, not to execute GPU work. During that trace:
+
+- `reg.*` allocates PTX registers and predicates
+- `smem.*` describes shared-memory allocations, barriers, and TMA descriptors
+- `ptx.*` records instructions into the kernel body — one call, one instruction
+
+The output is PTX. `print(kernel.ptx())` shows exactly what you authored. There are no hidden fusions, no loop reorderings, no register-level decisions made for you.
+
+## Target hardware
+
+| Architecture | Target | Key features |
+| --- | --- | --- |
+| **Hopper** | `sm_90a` | WGMMA, TMA 2D/3D with multicast, mbarriers, cluster launch |
+| **Blackwell** | `sm_100a` | `tcgen05.mma` / `.ld`, TMEM, SMEM descriptors, 2-SM cooperative MMA via `cta_group::2` |
+
+Pick the target with `arch="sm_90a"` or `arch="sm_100a"` in the `@kernel` decorator. Most examples have a direct Blackwell port — the same Python structure, a different `arch` string and a handful of instruction swaps.
+
+## Trace time vs emit time
+
+Understanding the two-phase execution model is the key to reading pyptx code:
+
+- **Trace time** — the Python function body runs on the host CPU. Python `for` loops, `if` statements, and helper functions are all resolved here. They generate PTX control flow (`ptx.loop`, `ptx.if_`), not Python control flow that runs on the GPU.
+- **Emit time** — `kernel.ptx()` is called (explicitly or on first launch). The recorded instructions are serialized into a PTX string and JIT-compiled by the driver via `cuModuleLoadData`.
+
+This distinction matters for loops: a Python `for i in range(4):` at trace time unrolls into four PTX instructions. A `ptx.loop(...)` at trace time emits a PTX branch-back loop.
+
+## Three runtime paths
+
+The same kernel object works across all three launch paths without modification:
+
+```python
+# PyTorch eager — dispatches through torch.library.custom_op
+out = kernel(a, b)
+
+# torch.compile — lowers through custom_op into the compiled graph
+out = torch.compile(kernel)(a, b)
+
+# JAX jit — registers as a typed FFI handler
+out = jax.jit(kernel)(a, b)
+```
+
+Under the hood, PTX is JIT-compiled through `cuModuleLoadData`, and a ~150-line C++ launch shim handles `cuLaunchKernel` for both frameworks. PyTorch dispatch overhead is ~14 µs with `ninja` installed; CUDA graph replay drops that to ~4 µs.
+
+## PTX transpiler
+
+pyptx ships a real PTX parser and emitter that round-trips 218+ corpus files byte-identical. It also includes a transpiler that converts existing PTX — from `nvcc`, Triton, Pallas, or any other source — into editable pyptx Python:
+
+```bash
+python -m pyptx.codegen kernel.ptx --sugar --name my_kernel > my_kernel.py
+```
+
+The `--sugar` flag demangles names, collapses mbarrier-wait spin-loops into `ptx.loop(...)`, and groups expression chains. The 815 TFLOPS Hopper GEMM in `examples/hopper/gemm_highperf_hopper.py` started as the output of this command applied to [fast.cu's kernel12](https://github.com/pranjalssh/fast.cu).
+
+<Note>
+  pyptx is version 0.1.0 and Linux-only. Python 3.10 or later is required. An NVIDIA GPU with `sm_90a` (H100 / H200) or `sm_100a` (B200) is needed to run kernels; the DSL, parser, and transpiler all work without a GPU.
+</Note>

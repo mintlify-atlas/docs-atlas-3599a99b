@@ -1,0 +1,441 @@
+---
+title: "ptx namespace — PTX instruction wrappers"
+description: "Reference for the pyptx.ptx namespace: instruction sub-namespaces, control flow helpers, special registers, wgmma, mbarrier, cp.async, tcgen05, and the raw escape hatch."
+---
+
+The `ptx` module is the main instruction namespace. Every call emits exactly one PTX instruction — no hidden scheduling, no lowering passes. Ten calls produce ten instructions.
+
+```python
+from pyptx import ptx, reg
+from pyptx.types import f32, u32
+
+# Inside a @kernel body:
+tid = reg.from_(ptx.special.tid.x(), u32)
+ptx.inst.add.f32(acc, acc, val)
+ptx.ret()
+```
+
+---
+
+## Special registers — `ptx.special`
+
+Access PTX built-in registers without boilerplate.
+
+<ResponseField name="ptx.special.tid" type="_DimReg">
+  Thread index within the CTA. Call `.x()`, `.y()`, or `.z()` to get a `Reg`.
+</ResponseField>
+
+<ResponseField name="ptx.special.ntid" type="_DimReg">
+  CTA dimensions. Call `.x()`, `.y()`, or `.z()`.
+</ResponseField>
+
+<ResponseField name="ptx.special.ctaid" type="_DimReg">
+  CTA index within the grid. Call `.x()`, `.y()`, or `.z()`.
+</ResponseField>
+
+<ResponseField name="ptx.special.nctaid" type="_DimReg">
+  Grid dimensions. Call `.x()`, `.y()`, or `.z()`.
+</ResponseField>
+
+<ResponseField name="ptx.special.laneid()" type="Reg">
+  Lane index within the warp (`%laneid`).
+</ResponseField>
+
+<ResponseField name="ptx.special.warpid()" type="Reg">
+  Warp index within the CTA (`%warpid`).
+</ResponseField>
+
+<ResponseField name="ptx.special.clock()" type="Reg">
+  Cycle counter (`%clock`).
+</ResponseField>
+
+**Convenience aliases:**
+
+```python
+cta_x = ptx.ctaid_x()   # %ctaid.x
+cta_y = ptx.ctaid_y()   # %ctaid.y
+```
+
+**Arbitrary special registers** via `ptx.sreg(name)`:
+
+```python
+rank = ptx.sreg("%cluster_ctarank")
+smid = ptx.sreg("%smid")
+```
+
+---
+
+## Control flow
+
+### `ptx.if_(pred)` / `ptx.else_()`
+
+Conditional block. Emits a branch to skip the body when the predicate is false. Chain with `ptx.else_()` for if-else.
+
+```python
+is_leader = reg.scalar(pred)
+
+with ptx.if_(is_leader):
+    ptx.mbarrier.init(bar[0], 128)
+
+with ptx.if_(p):
+    ptx.inst.mov.u32(dst, 1)
+with ptx.else_():
+    ptx.inst.mov.u32(dst, 0)
+```
+
+Negated predicates use `~`:
+
+```python
+with ptx.if_(~p):   # @!p bra ...
+    ...
+```
+
+### `ptx.loop(label, *, pred)`
+
+Emit a labeled backward-branch loop. The loop body goes inside the `with` block.
+
+```python
+with ptx.loop("k_loop", pred=continue_p):
+    # loop body
+    # emits: @%pN bra k_loop; at end
+
+# Unconditional (persistent kernel):
+with ptx.loop("tile_loop"):
+    # emits: bra.uni tile_loop;
+```
+
+### `ptx.range_(start, stop, step=1)`
+
+Structured counted loop. `start` can be a Python `int` or a `Reg` (for persistent kernels). Yields the loop variable as a `Reg`.
+
+```python
+for k in ptx.range_(0, K, BK):
+    # k is a Reg holding the current value
+
+# Persistent: start from ctaid.x
+cta_id = reg.from_(ptx.special.ctaid.x(), u32)
+for tile in ptx.range_(cta_id, total_tiles, NUM_SM):
+    ...
+```
+
+Emitted PTX:
+
+```
+mov.s32  %r0, 0;
+$loop:
+setp.ge.s32  %p0, %r0, K;
+@%p0 bra $endloop;
+    ... body ...
+add.s32  %r0, %r0, BK;
+bra $loop;
+$endloop:
+```
+
+### `ptx.ret(*, pred=None)`
+
+Emit `ret;` — terminates the kernel or returns from a device function.
+
+### `ptx.bra(label, *, pred=None)`
+
+Emit an unconditional (or predicated) `bra label;`.
+
+### `ptx.label(name)`
+
+Emit a label: `name:`.
+
+### `ptx.scope()`
+
+Open a PTX `{ }` block scope. Register declarations inside are local to the scope.
+
+```python
+with ptx.scope():
+    tmp = reg.scalar(b32, name="tmp")
+    ptx.inst.mov.b32(tmp, 42)
+# tmp is no longer in scope
+```
+
+### `ptx.expr()`
+
+Buffer a Python expression's PTX instructions into a single `CompoundExpr` IR node. Useful for compact one-liner arithmetic chains.
+
+```python
+with ptx.expr():
+    rd[26] = ((r[192] - 8192) & 0x3FF80) >> 4
+```
+
+---
+
+## Generic instruction namespace — `ptx.inst`
+
+The `ptx.inst` dot-chain escape hatch emits any PTX instruction. Supports arbitrary opcode chains via attribute access.
+
+```python
+ptx.inst.mov.b32(dst, src)
+ptx.inst.add.f32(d, a, b)
+ptx.inst.ld.global.b64(rd, ptx.addr(ptr))
+ptx.inst.cvta.to.global_.u64(rd, rd)
+ptx.inst.shfl.sync.bfly.b32(tmp, src, mask, 31, -1)
+```
+
+The trailing `_` convention resolves name conflicts with Python keywords: `global_` → `.global`, `and_` → `.and`.
+
+---
+
+## Typed convenience wrappers
+
+These wrappers provide typed signatures for the most common instructions.
+
+<AccordionGroup>
+  <Accordion title="Arithmetic — mov, add, sub, mul, mad, shl, shr">
+
+```python
+ptx.mov(f32, dst, src)
+ptx.add(u32, dst, a, b)
+ptx.sub(s32, dst, a, b)
+ptx.mul(u32, dst, a, b, mode="lo")   # mode: "lo", "hi", "wide"
+ptx.mad(s32, dst, a, b, c)           # dst = a*b + c
+ptx.shl(b32, dst, a, shift_amount)
+ptx.shr(u32, dst, a, shift_amount)
+```
+
+  </Accordion>
+  <Accordion title="Logic — and_, or_, xor_, not_">
+
+```python
+ptx.and_(b32, dst, a, b)
+ptx.or_(b64, dst, a, b)
+ptx.xor_(b32, dst, a, b)
+ptx.not_(b32, dst, src)
+```
+
+  </Accordion>
+  <Accordion title="Comparison — setp, selp">
+
+```python
+ptx.setp("lt", u32, pred_out, a, b)
+ptx.selp(f32, dst, true_val, false_val, pred_reg)
+```
+
+  </Accordion>
+  <Accordion title="Memory — ld, st, cvt, cvta">
+
+```python
+ptx.ld(f32, dst, addr_reg, space="global", cache="ca")
+ptx.st(f32, addr_reg, src, space="global")
+ptx.cvt(f32, u32, dst, src, rounding="rn")
+ptx.cvta.to_global(src_reg)      # cvta.to.global.u64
+ptx.cvta.param(src_reg)          # cvta.param.u64
+```
+
+  </Accordion>
+  <Accordion title="Address and param helpers">
+
+```python
+# Build [base] / [base+offset] address operands
+ptx.addr(rd)           # → [%rd0]
+ptx.addr(rd, 16)       # → [%rd0+16]
+ptx.addr("param0")     # → [param0]
+ptx.addr(A)            # → [A]  (TensorSpec)
+
+# Load kernel parameters
+ptx.global_ptrs(A, B, C)  # ld.param.u64 + cvta.to.global for each
+ptx.param(u64, "A", dst)  # explicit ld.param
+```
+
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## `ptx.raw(text)` — escape hatch
+
+Emit a raw PTX instruction string directly. The string is parsed and recorded as an IR instruction. Use for instructions that don't have a typed wrapper yet.
+
+```python
+ptx.raw("tcgen05.mma.cta_group::1.kind::f16 [d_tmem], a_desc, b_desc, idesc;")
+```
+
+---
+
+## WGMMA — `ptx.wgmma`
+
+Hopper warp-group matrix multiply-accumulate instructions.
+
+```python
+# Emit wgmma.mma_async.sync.aligned
+ptx.wgmma.mma_async(
+    shape=(64, 256, 16),
+    dtype_d=f32,
+    dtype_a=bf16,
+    dtype_b=bf16,
+    d=acc,          # RegArray (accumulator fragment)
+    a=a_desc,       # u64 descriptor Reg
+    b=b_desc,       # u64 descriptor Reg
+    scale_d=True,   # True = accumulate D += A*B
+)
+ptx.wgmma.fence()
+ptx.wgmma.commit_group()
+ptx.wgmma.wait_group(0)
+```
+
+**Build descriptors:**
+
+```python
+# Auto-descriptor from SharedAlloc (preferred)
+a_desc = ptx.wgmma.auto_descriptor(sA[stage], dtype=bf16, shape=(BM, BK), major="K")
+
+# Manual descriptor
+a_desc = ptx.wgmma.make_descriptor(
+    sA[stage],
+    leading_byte_offset=16,
+    stride_byte_offset=128,
+    swizzle=ptx.wgmma.SWIZZLE_128B,
+)
+```
+
+---
+
+## mbarrier — `ptx.mbarrier`
+
+Hopper mbarrier synchronization primitives.
+
+```python
+ptx.mbarrier.init(bar[0], count=128)
+ptx.fence.proxy_async_shared_cta()
+
+# Producer: announce expected bytes then issue TMA
+state = ptx.mbarrier.arrive_expect_tx(bar[0], tx_bytes)
+
+# Consumer: block until complete
+ptx.mbarrier.wait(bar[0], phase)          # spin loop
+p = ptx.mbarrier.try_wait(bar[0], phase)  # non-blocking, returns pred
+```
+
+<ParamField path="mbar" type="MbarrierRef" required>
+  Reference to a single mbarrier from `smem.mbarrier(N)[i]`.
+</ParamField>
+
+<ParamField path="count" type="int" required>
+  Expected arrival count for `init`.
+</ParamField>
+
+<ParamField path="tx_count" type="int | Reg" required>
+  Expected byte count for `arrive_expect_tx` / `expect_tx`.
+</ParamField>
+
+<ParamField path="phase" type="Reg | int" required>
+  Phase bit (0 or 1) for `wait` / `try_wait`.
+</ParamField>
+
+---
+
+## cp.async — `ptx.cp`
+
+Async copy instructions via `ptx.cp.async_` and `ptx.cp.async_bulk`.
+
+```python
+# TMA bulk tensor load (cp.async.bulk.tensor.2d)
+ptx.cp.async_.bulk.tensor_2d(
+    dst=sA[stage],
+    src=A.tma_desc(),
+    coord=(x, y),
+    mbar=bar[stage],
+)
+```
+
+---
+
+## Blackwell tensor core — `ptx.tcgen05`
+
+Blackwell tcgen05 alloc/dealloc/mma/ld/st/cp instructions.
+
+```python
+ptx.tcgen05.alloc(tmem_addr, ncols=256, cta_group=1)
+ptx.tcgen05.mma(d_tmem, a_desc, b_desc, idesc, kind="f16")
+ptx.tcgen05.fence_before_thread_sync()
+ptx.tcgen05.wait_ld()
+ptx.tcgen05.dealloc(tmem_addr, ncols=256)
+```
+
+Build Blackwell descriptors:
+
+```python
+a_desc = ptx.tcgen05.descriptor(
+    sA[0],
+    stride_bytes=128,
+    leading_bytes=16,
+    swizzle="128B",
+)
+idesc = ptx.tcgen05.make_instr_desc_f16bf16_f32(
+    m=128, n=256, ab_dtype="bf16", a_major="K",
+)
+```
+
+---
+
+## fence — `ptx.fence`
+
+```python
+ptx.fence.proxy_async()                      # fence.proxy.async;
+ptx.fence.proxy_async_shared_cta()           # fence.proxy.async.shared::cta;
+ptx.fence.mbarrier_init()                    # fence.mbarrier_init.release.cluster;
+```
+
+---
+
+## Cluster barriers — `ptx.cluster`
+
+```python
+ptx.cluster.arrive()
+ptx.cluster.wait()
+ptx.cluster.sync()           # arrive + wait
+ptx.cluster.arrive_remote(bar_addr, peer_cta_id)
+p = ptx.cluster.rank(0)      # pred: this CTA is rank 0
+```
+
+---
+
+## Warp reductions — `ptx.warp`
+
+In-place butterfly reductions over a warp or sub-group.
+
+```python
+ptx.warp.reduce_sum(val, width=32)   # full-warp sum
+ptx.warp.reduce_max(val, width=4)    # 4-lane max (for wgmma rows)
+ptx.warp.reduce_min(val)
+```
+
+---
+
+## Pipeline helpers
+
+```python
+# Ring-buffered pipeline cursor + phase
+pipe = ptx.pipeline(n_stages=3)
+stage, phase = pipe.advance()   # emits setp + add + xor
+```
+
+---
+
+## Debug directives
+
+```python
+ptx.pragma("nounroll")
+ptx.loc(1, 40, 0)         # .loc 1 40 0
+ptx.file_(1, "kernel.py") # .file 1 "kernel.py"
+```
+
+---
+
+## Miscellaneous helpers
+
+```python
+ptx.setmaxnreg(128, inc=True)    # setmaxnreg.inc.sync.aligned.u32 128
+ptx.setmaxnreg_inc(160)
+ptx.setmaxnreg_dec(40)
+ptx.elect_sync(dst, pred_out, membermask=0xFFFFFFFF)
+ptx.selp(u32, dst, true_val, false_val, pred)
+ptx.bar.sync(0)
+nb = ptx.named_barrier(3, count=64)
+nb.sync()
+```

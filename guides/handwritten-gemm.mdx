@@ -1,0 +1,244 @@
+---
+title: "Warp-Specialized Hopper GEMM: 815 TFLOPS"
+description: "Step-by-step walkthrough of the pyptx Hopper GEMM kernel: TMA staging, mbarrier synchronization, WGMMA tensor-core math, and epilogue fragment scatter."
+---
+
+The Hopper GEMM in `examples/hopper/gemm_highperf_hopper.py` reaches **815 TFLOPS at 8192×8192 bf16 on H100 SXM5** — beating cuBLAS (~740 TFLOPS) at matrix sizes ≥ 6144. It is the maintained high-performance GEMM example and the canonical demonstration of pyptx's tensor-core surface.
+
+The kernel computes `C[M, N] = A[M, K] @ B[K, N]` with A and B in bf16 and accumulation in f32.
+
+<Note>
+Looking for Blackwell? The `sm_100a` equivalent is in `examples/blackwell/gemm_highperf_blackwell.py`. It uses `tcgen05.mma` and TMEM instead of WGMMA, plus a 2-SM `build_gemm_2sm` variant. See [Blackwell GEMM](/guides/blackwell-gemm).
+</Note>
+
+## Architecture of the Kernel
+
+The high-perf kernel is a warp-specialized producer/consumer pipeline:
+
+- **1 producer warpgroup** (warpgroup 0): issues 3D TMA loads for A and B tiles, signals `full` barriers.
+- **2 consumer warpgroups** (warpgroups 1 and 2): wait on barriers, issue `wgmma.mma_async m64n256k16`, write the epilogue via TMA stores.
+- **3-stage SMEM ring buffer**: ~220 KB dynamic SMEM (49 KB A tiles + 98 KB B tiles + 70 KB C buffer + barriers).
+- **Hilbert tile schedule**: space-filling traversal of output tiles for L2 locality.
+
+The simpler maintained reference example (`gemm_m64n64k16`) uses the same structural idioms at a smaller scale with one warpgroup and one barrier per K-slice. The walkthrough below covers the readable reference shape.
+
+## Step 1: Specialize the Kernel Shape
+
+```python
+def build_gemm_m64n64(M: int, N: int, K: int, *, tile_k: int = 16):
+    BM, BN = 64, 64
+    assert M % BM == 0 and N % BN == 0 and K % tile_k == 0
+    n_iters = K // tile_k
+```
+
+Each CTA computes one `64 × 64` output tile. The K loop has `n_iters = K / tile_k` steps, each step doing one `wgmma.mma_async.m64n64k16`.
+
+```python
+@kernel(
+    in_specs=(
+        Tile.wgmma_a(M, K, bf16, tile_m=BM, tile_k=tile_k),
+        Tile.wgmma_b(K, N, bf16, tile_k=tile_k, tile_n=BN),
+    ),
+    out_specs=(Tile(M, N, f32),),
+    grid=(N // BN, M // BM, 1),
+    block=(128, 1, 1),
+    arch="sm_90a",
+)
+def gemm(A, B, C):
+    ...
+```
+
+`block=(128, 1, 1)` is exactly one Hopper warpgroup — required because WGMMA is warpgroup-scoped.
+
+## Step 2: Allocate SMEM Tiles and Accumulators
+
+```python
+sA   = smem.wgmma_tile(bf16, (BM, tile_k), major="K")
+sB   = smem.wgmma_tile(bf16, (tile_k, BN), major="MN")
+bars = [smem.mbarrier(1) for _ in range(n_iters)]
+phases = [reg.scalar(b32, init=0) for _ in range(n_iters)]
+acc  = reg.array(f32, 32)
+```
+
+- `sA`: K-major shared tile for A[64, 16].
+- `sB`: MN-major shared tile for B[16, 64].
+- `bars[i]`: one completion barrier per K-slice.
+- `acc`: the per-thread accumulator fragment. For `m64n64k16`, each of the 128 threads in the warpgroup owns **32 f32** values.
+
+`smem.wgmma_tile` picks the correct swizzle automatically and attaches layout metadata to the `SharedAlloc`. This metadata is consumed by `ptx.wgmma.mma_async` when it synthesizes the 64-bit WGMMA descriptor — you never set LBO, SBO, or swizzle by hand.
+
+## Step 3: Compute the CTA's Output Tile
+
+```python
+row_off = reg.scalar(u32)
+ptx.inst.mov.u32(row_off, ptx.special.ctaid.y())
+ptx.inst.shl.b32(row_off, row_off, 6)   # ctaid.y * 64
+
+col_off = reg.scalar(u32)
+ptx.inst.mov.u32(col_off, ptx.special.ctaid.x())
+ptx.inst.shl.b32(col_off, col_off, 6)   # ctaid.x * 64
+```
+
+Shift by 6 because `2^6 = 64`. All global-memory accesses in this CTA are relative to `(row_off, col_off)`.
+
+## Step 4: Initialize TMA Barriers
+
+```python
+tid = ptx.special.tid.x()
+with ptx.if_(tid == 0):
+    for bar in bars:
+        ptx.mbarrier.init(bar[0], 1)
+    ptx.fence.proxy_async_shared_cta()
+```
+
+Only thread 0 initializes. The fence is required so the async TMA proxy sees the barrier in its initialized state. One barrier per loop iteration — simple but correct for the reference shape.
+
+## Step 5: Walk the K Dimension
+
+The main loop iterates over K in `tile_k`-wide slices:
+
+```python
+for i in range(n_iters):
+    k_off = reg.scalar(u32)
+    ptx.inst.mov.u32(k_off, i * tile_k)
+    # ...
+```
+
+For K=2048, tile_k=16: that's 128 iterations, 128 WGMMA instructions, 128 TMA loads each for A and B.
+
+## Step 6: Issue TMA Loads
+
+```python
+with ptx.if_(tid == 0):
+    ptx.mbarrier.arrive_expect_tx(
+        bars[i][0],
+        BM * tile_k * 2 + tile_k * BN * 2,   # A bytes + B bytes
+    )
+    ptx.cp.async_.bulk.tensor_2d(
+        dst=sA[0], src=A.tma_desc(),
+        coord=(k_off, row_off), mbar=bars[i][0],
+    )
+    ptx.cp.async_.bulk.tensor_2d(
+        dst=sB[0], src=B.tma_desc(),
+        coord=(col_off, k_off), mbar=bars[i][0],
+    )
+```
+
+Coordinate conventions:
+- `A.coord = (k_off, row_off)` → loads `A[row_off:row_off+64, k_off:k_off+16]`
+- `B.coord = (col_off, k_off)` → loads `B[k_off:k_off+16, col_off:col_off+64]`
+
+Both tiles share one barrier. `arrive_expect_tx` tells the barrier the total byte count across both loads — the barrier releases only after all bytes land.
+
+## Step 7: Synchronize, Then Run WGMMA
+
+```python
+ptx.bar.sync(0)
+ptx.mbarrier.wait(bars[i][0], phases[i])
+```
+
+`bar.sync(0)`: CTA-wide lockstep — all 128 threads reach this point before anyone waits.
+`mbarrier.wait`: blocks until TMA bytes have landed in `sA` and `sB`.
+
+Then the math:
+
+```python
+ptx.wgmma.fence()
+ptx.wgmma.mma_async(
+    shape=(64, 64, 16),
+    dtype_d=f32, dtype_a=bf16, dtype_b=bf16,
+    d=acc, a=sA, b=sB,
+    scale_d=(i != 0),   # first iter: init acc; subsequent: accumulate
+    trans_a=0, trans_b=1,
+)
+ptx.wgmma.commit_group()
+ptx.wgmma.wait_group(0)
+```
+
+`scale_d=(i != 0)` is the accumulation control: on the first K-slice, do not scale the old (uninitialized) accumulator; on all subsequent slices, add to the existing `acc`. This is how many `m64n64k16` partial products combine into one full 64×64 GEMM tile.
+
+## Step 8: Fragment Layout and Epilogue
+
+WGMMA does not hand each thread a neat row-major slice. It distributes a scattered fragment across lanes in a hardware-defined pattern. The epilogue decodes that pattern.
+
+For `m64n64k16`, each of the 128 threads owns **32 f32** values arranged as:
+
+```
+Warp 0:  rows  0-15
+Warp 1:  rows 16-31
+Warp 2:  rows 32-47
+Warp 3:  rows 48-63
+
+Within each warp: lane i owns rows (lane>>2) and (lane>>2)+8,
+                  and columns [(lane&3)*2 .. (lane&3)*2+1] of each column group
+```
+
+The bitmath that decodes this:
+
+```python
+tid2 = reg.scalar(u32)
+ptx.inst.mov.u32(tid2, ptx.special.tid.x())
+wid      = tid2 >> 5            # warp index (0–3)
+lane     = tid2 & 31            # lane within warp (0–31)
+frag_row = (wid << 4) + (lane >> 2)  # wid*16 + lane/4
+frag_col = (lane & 3) << 1            # (lane%4)*2
+ptx.inst.add.u32(frag_row, frag_row, row_off)
+ptx.inst.add.u32(frag_col, frag_col, col_off)
+```
+
+The store loop scatters all 32 registers to global memory:
+
+```python
+(pc,) = ptx.global_ptrs(C)
+for g in range(8):                      # 8 column groups (each 8 cols wide)
+    for li, (is_b, c_off) in enumerate([(0,0),(0,1),(1,0),(1,1)]):
+        row = frag_row + 8 if is_b else frag_row
+        col = frag_col + g * 8 + c_off
+        off = (row * N + col) * 4
+        ptx.inst.st.global_.f32(ptx.addr(pc + off), acc[g * 4 + li])
+```
+
+The inner iterator `[(0,0),(0,1),(1,0),(1,1)]` stores: row at frag_row col+0, row+0 col+1, row+8 col+0, row+8 col+1. That's the hardware fragment pack order.
+
+## The High-Perf Kernel: Additional Techniques
+
+The full `gemm_warp_specialized` in `gemm_highperf_hopper.py` adds several performance techniques beyond the reference shape:
+
+| Technique | Description |
+|---|---|
+| **3D TMA descriptors** | Wider blocks with less padding, enables m64n256k16 WGMMA |
+| **2-CTA clusters + multicast** | Two SMs share one B tile load (multicast TMA) |
+| **3-stage ring buffer** | TMA for K+2 overlaps MMA for K |
+| **Hilbert tile schedule** | Space-filling output traversal for L2 locality |
+| **TMA store epilogue** | C written back via TMA rather than scatter stores |
+| **220 KB dynamic SMEM** | `smem=SMEM_TOTAL` on the decorator, `extern_smem=True` |
+
+## Full Timeline for One CTA
+
+1. Pick the `64 × 64` output tile from `ctaid.x` and `ctaid.y`.
+2. Allocate SMEM staging for one A tile and one B tile.
+3. Initialize one mbarrier per K-slice.
+4. For each 16-wide K block:
+   - TMA-load `A_tile` and `B_tile`
+   - Wait for the loads
+   - Issue `wgmma.mma_async.m64n64k16`
+   - Accumulate into `acc`
+5. Map each lane's fragment coordinates.
+6. Scatter the 32 f32 accumulator values to global C.
+
+## What To Read Next
+
+<CardGroup cols={2}>
+  <Card title="Blackwell GEMM" href="/guides/blackwell-gemm">
+    The sm_100a equivalent with tcgen05.mma, TMEM, and 4-stage ring buffers.
+  </Card>
+  <Card title="Mbarriers and Async Sync" href="/guides/mbarriers">
+    Full reference for the mbarrier pattern used in the K loop.
+  </Card>
+  <Card title="Tiles, Layouts, and TMA" href="/guides/tiles-layouts-tma">
+    How Tile.wgmma_a/b and smem.wgmma_tile compose into correct descriptors.
+  </Card>
+  <Card title="Debugging" href="/guides/debugging">
+    Diagnosing fragment layout bugs, swizzle mismatches, and illegal memory accesses.
+  </Card>
+</CardGroup>
